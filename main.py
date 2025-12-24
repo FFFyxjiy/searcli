@@ -134,26 +134,79 @@ HTML = """
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Searcli</title>
     <style>
-        :root { --bg: #ffffff; --text: #202124; --primary: #8e44ad; --border: #dfe1e5; --sub: #70757a; }
-        @media (prefers-color-scheme: dark) { :root { --bg: #121212; --text: #e8eaed; --primary: #bb86fc; --border: #333; --sub: #9aa0a6; } }
-        body { font-family: sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 0; }
-        .container { max-width: 800px; margin: 0 auto; padding: 20px; display: flex; flex-direction: column; align-items: center; }
-        .logo-box { text-align: center; margin: 40px 0; }
-        .logo { font-size: 72px; font-weight: 500; color: var(--primary); text-decoration: none; }
-        .dev { font-size: 14px; font-weight: 300; color: #666; letter-spacing: 1px; }
-        @media (prefers-color-scheme: dark) { .dev { color: #fff; } }
-        .widgets { display: flex; gap: 10px; margin-bottom: 30px; }
-        .widget { background: var(--border); padding: 10px 20px; border-radius: 12px; text-align: center; min-width: 100px; }
-        .search-input { width: 100%; max-width: 600px; padding: 15px 25px; border-radius: 50px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 18px; outline: none; }
-        .tabs { margin: 20px 0; display: flex; gap: 20px; }
-        .tab { text-decoration: none; color: var(--sub); font-size: 14px; }
-        .tab.active { color: var(--primary); font-weight: bold; border-bottom: 2px solid var(--primary); }
-        .res-item { width: 100%; margin-bottom: 30px; text-align: left; }
-        .res-title { font-size: 20px; color: var(--primary); text-decoration: none; }
-        .rating-bar { width: 100px; height: 4px; background: #ddd; border-radius: 2px; margin-top: 8px; overflow: hidden; }
-        .img-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; width: 100%; }
-        .img-card { height: 150px; border-radius: 8px; overflow: hidden; background: #333; }
+        :root { 
+            --bg: #ffffff; --text: #202124; --primary: #8e44ad; --border: #dfe1e5; 
+            --sub: #70757a; --dev-text: #666; --accent: #27ae60;
+        }
+        @media (prefers-color-scheme: dark) {
+            :root { 
+                --bg: #121212; --text: #e8eaed; --primary: #bb86fc; --border: #333; 
+                --sub: #9aa0a6; --dev-text: #fff;
+            }
+        }
+
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 0; overflow-x: hidden; }
+        
+        .container { 
+            width: 100%; max-width: 800px; margin: 0 auto; padding: 15px; 
+            box-sizing: border-box; display: flex; flex-direction: column; align-items: center; 
+        }
+
+        /* Logo Section */
+        .logo-box { text-align: center; margin: 40px 0 20px; width: 100%; }
+        .logo { font-size: clamp(48px, 15vw, 72px); font-weight: 500; color: var(--primary); text-decoration: none; display: block; }
+        .developer { font-size: 14px; font-weight: 300; margin-top: 5px; opacity: 0.8; }
+
+        /* Widgets Grid - Улучшенная адаптивность */
+        .widgets { 
+            display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; 
+            margin-bottom: 25px; width: 100%; max-width: 500px; 
+        }
+        .widget { 
+            background: var(--card, var(--border)); padding: 12px; 
+            border-radius: 15px; text-align: center; opacity: 0.9;
+        }
+        .widget-val { font-size: 18px; font-weight: bold; }
+        .widget-label { font-size: 10px; text-transform: uppercase; margin-top: 4px; }
+
+        /* Search Form */
+        .search-form { width: 100%; margin-bottom: 20px; }
+        .search-input { 
+            width: 100%; padding: 16px 24px; border-radius: 30px; 
+            border: 1px solid var(--border); background: var(--bg); 
+            color: var(--text); font-size: 16px; outline: none; 
+            box-sizing: border-box; -webkit-appearance: none; /* Убирает тени на iOS */
+        }
+
+        /* Tabs */
+        .tabs { display: flex; gap: 25px; margin-bottom: 20px; border-bottom: 1px solid var(--border); width: 100%; justify-content: center; }
+        .tab { text-decoration: none; color: var(--sub); font-size: 15px; padding: 10px 5px; position: relative; }
+        .tab.active { color: var(--primary); font-weight: bold; }
+        .tab.active::after { content: ''; position: absolute; bottom: -1px; left: 0; width: 100%; height: 2px; background: var(--primary); }
+
+        /* Results */
+        .res-item { width: 100%; margin-bottom: 25px; word-wrap: break-word; }
+        .res-title { font-size: 18px; color: var(--primary); text-decoration: none; line-height: 1.3; }
+        .snippet { font-size: 14px; color: var(--sub); margin-top: 6px; line-height: 1.5; }
+        .rating-box { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 12px; }
+        .rating-bar { flex: 0 0 80px; height: 5px; background: #ddd; border-radius: 3px; overflow: hidden; }
+
+        /* Images Grid - Резина */
+        .img-grid { 
+            display: grid; 
+            grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); 
+            gap: 8px; width: 100%; 
+        }
+        .img-card { aspect-ratio: 1/1; border-radius: 10px; overflow: hidden; background: #333; }
         .img-card img { width: 100%; height: 100%; object-fit: cover; }
+
+        /* Mobile Optimization */
+        @media (max-width: 480px) {
+            .container { padding: 10px; }
+            .logo-box { margin-top: 20px; }
+            .res-title { font-size: 17px; }
+            .widgets { grid-template-columns: 1fr 1fr; }
+        }
     </style>
 </head>
 <body>
