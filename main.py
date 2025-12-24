@@ -19,11 +19,9 @@ class DatabaseManager:
 
     def create_tables(self):
         cursor = self.conn.cursor()
-        cursor.execute(
-            'CREATE TABLE IF NOT EXISTS docs (id INTEGER PRIMARY KEY, url TEXT UNIQUE, title TEXT, views INTEGER, content TEXT)')
+        cursor.execute('CREATE TABLE IF NOT EXISTS docs (id INTEGER PRIMARY KEY, url TEXT UNIQUE, title TEXT, views INTEGER, content TEXT)')
         cursor.execute('CREATE TABLE IF NOT EXISTS words (word TEXT, doc_id INTEGER, count INTEGER)')
-        cursor.execute(
-            'CREATE TABLE IF NOT EXISTS images (id INTEGER PRIMARY KEY, img_url TEXT UNIQUE, page_url TEXT, alt TEXT)')
+        cursor.execute('CREATE TABLE IF NOT EXISTS images (id INTEGER PRIMARY KEY, img_url TEXT UNIQUE, page_url TEXT, alt TEXT)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_w ON words(word)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_img_alt ON images(alt)')
         self.conn.commit()
@@ -31,83 +29,44 @@ class DatabaseManager:
     def add_all(self, url, title, words, text, images):
         cursor = self.conn.cursor()
         try:
-            cursor.execute("INSERT OR IGNORE INTO docs (url, title, views, content) VALUES (?, ?, ?, ?)",
+            cursor.execute("INSERT OR IGNORE INTO docs (url, title, views, content) VALUES (?, ?, ?, ?)", 
                            (url, title, random.randint(1000, 100000), text))
             row = cursor.execute("SELECT id FROM docs WHERE url=?", (url,)).fetchone()
             if row:
                 doc_id = row[0]
                 cursor.executemany("INSERT INTO words VALUES (?, ?, ?)", [(w, doc_id, c) for w, c in words.items()])
                 for img_url, alt in images:
-                    if img_url and len(img_url) < 500:  # Защита от слишком длинных data-urls
-                        cursor.execute("INSERT OR IGNORE INTO images (img_url, page_url, alt) VALUES (?, ?, ?)",
-                                       (img_url, url, alt))
+                    if img_url and len(img_url) < 500:
+                        cursor.execute("INSERT OR IGNORE INTO images (img_url, page_url, alt) VALUES (?, ?, ?)", (img_url, url, alt))
             self.conn.commit()
         except Exception:
             self.conn.rollback()
 
+    def search_text(self, query):
+        query_low = query.lower().strip()
+        q_words = [w for w in re.findall(r'[a-zа-яё0-9]{3,}', query_low) if w not in STOP_WORDS]
+        if not q_words: return []
+        cursor = self.conn.cursor()
+        res = {}
+        for word in q_words:
+            cursor.execute('SELECT d.id, d.url, d.title, i.count, d.views, d.content FROM words i JOIN docs d ON i.doc_id = d.id WHERE i.word = ?', (word,))
+            for d_id, url, title, tf, v, content in cursor.fetchall():
+                curr_title = (title or "").lower()
+                curr_content = (content or "").lower()
+                score = (math.log(tf + 1) * 2 + math.log(v + 1))
+                if word in curr_title: score *= 5.0
+                if len(q_words) > 1 and query_low in curr_title: score *= 40.0
+                elif len(q_words) > 1 and query_low in curr_content: score *= 10.0
+                if d_id not in res:
+                    res[d_id] = {'url': url, 'title': title or url, 'score': score, 'snippet': (content or "")[:160]}
+                else: res[d_id]['score'] += score
+        return sorted(res.values(), key=lambda x: x['score'], reverse=True)
 
-def search_text(self, query):
-    # 1. Подготовка запроса
-    query_low = query.lower().strip()
-    # Извлекаем слова (минимум 3 символа)
-    q_words = [w for w in re.findall(r'[a-zа-яё0-9]{3,}', query_low) if w not in STOP_WORDS]
-
-    if not q_words:
-        return []
-
-    cursor = self.conn.cursor()
-    res = {}
-
-    # 2. Поиск по каждому слову
-    for word in q_words:
-        cursor.execute('''
-                       SELECT d.id, d.url, d.title, i.count, d.views, d.content
-                       FROM words i
-                                JOIN docs d ON i.doc_id = d.id
-                       WHERE i.word = ?
-                       ''', (word,))
-
-        rows = cursor.fetchall()
-        for d_id, url, title, tf, v, content in rows:
-            # Защита от пустых значений
-            curr_title = (title or "").lower()
-            curr_content = (content or "").lower()
-
-            # Базовый вес: частота слова + логарифм просмотров
-            score = (math.log(tf + 1) * 2 + math.log(v + 1))
-
-            # Бонус за слово в заголовке
-            if word in curr_title:
-                score *= 5.0
-
-            # --- ИСПРАВЛЕНИЕ ОШИБКИ: ПРОВЕРКА ЦЕЛОЙ ФРАЗЫ ---
-            # Если в документе слова идут ровно так, как ввел пользователь
-            if len(q_words) > 1 and query_low in curr_title:
-                score *= 40.0  # Огромный приоритет за точное совпадение в заголовке
-            elif len(q_words) > 1 and query_low in curr_content:
-                score *= 10.0  # Хороший бонус за совпадение фразы в тексте
-
-            if d_id not in res:
-                res[d_id] = {
-                    'url': url,
-                    'title': title or url,
-                    'score': score,
-                    'snippet': self.gen_snip(content or "", q_words)
-                }
-            else:
-                # Если документ уже найден по другому слову из запроса, прибавляем очки
-                res[d_id]['score'] += score
-
-    # 3. Финальная сортировка по убыванию рейтинга
-    final_results = sorted(res.values(), key=lambda x: x['score'], reverse=True)
-    return final_results
-
-
-def search_img(self, query):
-    if not query: return []
-    cursor = self.conn.cursor()
-    cursor.execute("SELECT img_url, alt FROM images WHERE alt LIKE ? LIMIT 50", ('%' + query + '%',))
-    return cursor.fetchall()
+    def search_img(self, query):
+        if not query: return []
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT img_url, alt FROM images WHERE alt LIKE ? LIMIT 50", ('%' + query + '%',))
+        return cursor.fetchall()
 
 
 db = DatabaseManager()
@@ -135,7 +94,7 @@ async def crawler():
         "https://news.google.com/",
         "https://www.nytimes.com/",
         "https://www.youtube.com/",
-        "https://www.ya.com/",
+        "https://www.ya.ru/",
         "https://habr.com/ru/all/",
         "https://ru.wikipedia.org/"  # Постоянно новые ссылки
     ]
@@ -305,8 +264,13 @@ def home():
 
 @app.route('/search')
 def search():
-    q, t = request.args.get('q', ''), request.args.get('t', 'text')
-    res = db.search_img(q) if t == 'img' else db.search_text(q)
+    q = request.args.get('q', '')
+    t = request.args.get('t', 'text')
+    # Используем английские if и else
+    if t == 'img':
+        res = db.search_img(q)
+    else:
+        res = db.search_text(q)
     return render_template_string(HTML, q=q, t=t, results=res, w=get_widgets())
 
 
