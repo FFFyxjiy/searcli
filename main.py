@@ -120,33 +120,16 @@ def get_widgets():
     return data
 
 async def crawler():
-    # Глобальные "ворота" в интернет для максимального масштаба
     seeds = [
-        # Знания и энциклопедии
-        "https://ru.wikipedia.org/wiki/Служебная:Random",
-        "https://en.wikipedia.org/wiki/Special:Random",
-        "https://ru.citizendium.org/wiki/Main_Page",
-        
-        # Наука и технологии
-        "https://arxiv.org/",              # Крупнейший архив научных статей
-        "https://habr.com/ru/all/",        # IT-сообщество
-        "https://github.com/trending",     # Тренды программирования
-        
-        # Мировые новости и архивы
-        "https://www.reuters.com/",        # Мировое агентство новостей
-        "https://www.interfax.ru/",        # Главные новости СНГ
-        "https://www.bbc.com/russian",
-        
-        # Каталоги (дают ссылки на тысячи мелких сайтов)
-        "https://dmoz-odp.org/",           # Open Directory Project
-        "https://www.lenta.ru/",
-        "https://www.gutenberg.org/"       # Библиотека бесплатных книг (сотни тысяч страниц)
+        "https://ru.wikipedia.org/wiki/Список_самых_посещаемых_веб-сайтов",
+        "https://top100.rambler.ru/",
+        "https://www.liveinternet.ru/rating/ru/",
+        "https://en.wikipedia.org/wiki/Main_Page"
     ]
-    
     queue, visited = list(seeds), set()
     random.shuffle(queue)
     
-    headers = {'User-Agent': 'SearcliBot/1.0 (Labretto Project; Personal Search Engine)'}
+    headers = {'User-Agent': 'SearcliBot/1.0 (Labretto Project)'}
     
     async with aiohttp.ClientSession(headers=headers) as session:
         while queue and len(visited) < TARGET_PAGES:
@@ -154,60 +137,41 @@ async def crawler():
             if url in visited or not url.startswith('http'): continue
             
             try:
-                # Увеличим таймаут до 10 секунд для тяжелых архивов типа Arxiv
-                async with session.get(url, timeout=10) as r:
+                # Уменьшаем таймаут, чтобы быстрее "прощелкивать" битые ссылки
+                async with session.get(url, timeout=5) as r:
                     if r.status != 200: continue
-                    
-                    # Проверка на размер страницы (чтобы не качать PDF или огромные файлы)
-                    if int(r.headers.get('Content-Length', 0)) > 2000000: continue 
                     
                     html_text = await r.text(errors='ignore')
                     visited.add(url)
                     soup = BeautifulSoup(html_text, 'html.parser')
                     
-                    # Очистка и сбор данных
-                    for s in soup(["script", "style", "nav", "footer", "header"]):
-                        s.decompose()
+                    # Очистка мусора
+                    for s in soup(["script", "style", "aside"]): s.decompose()
                         
                     title = (soup.title.string or url).strip()
                     text = soup.get_text(separator=' ')
                     
-                    # Сбор картинок
-                    imgs = []
-                    for i in soup.find_all('img', src=True):
-                        src = urljoin(url, i['src'])
-                        alt = i.get('alt', '').strip()
-                        if len(alt) > 5 and src.startswith('http'):
-                            imgs.append((src, alt))
-                            if len(imgs) >= 5: break
-
-                    # Сохранение
-                    db.add_all(url, title, Counter(re.findall(r'[a-zа-яё0-9]{3,}', text.lower())), text, imgs)
+                    # Сохраняем (добавляем только если есть текст)
+                    if len(text) > 100:
+                        db.add_all(url, title, Counter(re.findall(r'[a-zа-яё0-9]{3,}', text.lower())), text, [])
                     
-                    # СБОР НОВЫХ ССЫЛОК (Стратегия прыжков)
-                    current_domain = urlparse(url).netloc
-                    page_links = []
-                    
+                    # СТРАТЕГИЯ ЗАХВАТА МИРА:
+                    # Мы ищем ссылки, которые ведут на ГЛАВНЫЕ страницы других сайтов
+                    links_found = 0
                     for a in soup.find_all('a', href=True):
                         link = urljoin(url, a['href'])
                         parsed = urlparse(link)
                         
-                        # Не берем соцсети (они часто блокируют ботов)
-                        if any(x in link for x in ['facebook', 'twitter', 'instagram', 'vk.com']):
-                            continue
-                            
-                        if parsed.netloc and link not in visited:
-                            if parsed.netloc != current_domain:
-                                queue.insert(0, link) # Внешние ссылки — в приоритет
-                            else:
-                                page_links.append(link)
+                        # Если ссылка — это главная страница другого сайта (путь пустой или '/')
+                        # Это поможет нам найти Ozon.ru, Youtube.com и т.д.
+                        if parsed.netloc and (parsed.path == "" or parsed.path == "/"):
+                            if link not in visited:
+                                queue.insert(0, link) # В самое начало!
+                                links_found += 1
                         
-                        if len(page_links) >= 8: break # Берем чуть больше ссылок для ветвления
-                    
-                    queue.extend(page_links)
-
+                        if links_found > 10: break
             except: continue
-            await asyncio.sleep(1.2) # Обязательная пауза
+            await asyncio.sleep(1)
 HTML = """
 <!DOCTYPE html>
 <html lang="ru">
