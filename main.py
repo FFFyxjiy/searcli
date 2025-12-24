@@ -87,53 +87,87 @@ def get_widgets():
 
 
 async def crawler():
-    # Мы добавляем мировые порталы, откуда ссылки ведут на миллионы других сайтов
+    # Список "стартовых ворот" для глобального поиска
     seeds = [
-        "https://dmoz-odp.org/",  # Открытый каталог ссылок
-        "https://www.reuters.com/",
-        "https://news.google.com/",
-        "https://www.nytimes.com/",
-        "https://www.youtube.com/",
-        "https://www.ya.ru/",
+        "https://ru.wikipedia.org/wiki/Служебная:Random", # Случайные статьи для разнообразия
+        "https://news.google.com/", 
+        "https://www.rbc.ru/",
         "https://habr.com/ru/all/",
-        "https://ru.wikipedia.org/"  # Постоянно новые ссылки
+        "https://www.dmoz-odp.org/",
+        "https://en.wikipedia.org/wiki/Main_Page"
     ]
-    q, visited = list(seeds), set()
-    async with aiohttp.ClientSession(headers={'User-Agent': 'SearcliBot/2.0 (by Labretto)'}) as session:
-        while q and len(visited) < TARGET_PAGES:
-            url = q.pop(0)
-            if url in visited: continue
+    
+    # Очередь ссылок и набор посещенных адресов
+    queue, visited = list(seeds), set()
+    
+    # Настройка сессии с User-Agent, чтобы сайты нас не блокировали
+    headers = {'User-Agent': 'SearcliBot/1.0 (Public Edition; by Labretto)'}
+    
+    async with aiohttp.ClientSession(headers=headers) as session:
+        while queue and len(visited) < TARGET_PAGES:
+            url = queue.pop(0)
+            if url in visited:
+                continue
+            
             try:
-                async with session.get(url, timeout=7) as r:
-                    if r.status != 200: continue
+                # Устанавливаем таймаут, чтобы не ждать "зависшие" сайты вечно
+                async with session.get(url, timeout=7) as response:
+                    if response.status != 200:
+                        continue
+                    
                     visited.add(url)
-                    html_text = await r.text(errors='ignore')
-                    soup = BeautifulSoup(html_text, 'html.parser')
-
-                    # Извлечение картинок с базовой фильтрацией мусора
+                    html_content = await response.text(errors='ignore')
+                    soup = BeautifulSoup(html_content, 'html.parser')
+                    
+                    # 1. Извлекаем картинки
                     imgs = []
                     for i in soup.find_all('img', src=True):
                         src = urljoin(url, i['src'])
-                        alt_t = i.get('alt', '').strip()
-                        if len(alt_t) > 3 and src.startswith('http'):
-                            imgs.append((src, alt_t))
-
-                    text_content = soup.get_text()
+                        alt = i.get('alt', '').strip()
+                        # Сохраняем только картинки с описанием (для качественного поиска)
+                        if src.startswith('http') and len(alt) > 3:
+                            imgs.append((src, alt))
+                    
+                    # 2. Извлекаем текст и заголовок
                     title = (soup.title.string or url).strip()
-                    word_counts = Counter(re.findall(r'[a-zа-яё0-9]{3,}', text_content.lower()))
-
-                    db.add_all(url, title, word_counts, text_content, imgs)
-
-                    # Лимит на очередь, чтобы не переполнять память
-                    if len(q) < 5000:
-                        for a in soup.find_all('a', href=True):
-                            l = urljoin(url, a['href'])
-                            if urlparse(l).netloc and l not in visited:
-                                q.append(l)
-            except Exception:
+                    full_text = soup.get_text()
+                    # Считаем частоту слов (минимум 3 символа)
+                    word_counts = Counter(re.findall(r'[a-zа-яё0-9]{3,}', full_text.lower()))
+                    
+                    # 3. Сохраняем всё в нашу базу данных
+                    db.add_all(url, title, word_counts, full_text, imgs)
+                    
+                    # 4. Собираем новые ссылки для масштабирования поиска
+                    links_from_page = 0
+                    current_domain = urlparse(url).netloc
+                    
+                    for a in soup.find_all('a', href=True):
+                        link = urljoin(url, a['href'])
+                        parsed_link = urlparse(link)
+                        
+                        # Проверяем, что это реальная ссылка, а не якорь или скрипт
+                        if parsed_link.netloc and link not in visited:
+                            # СТРАТЕГИЯ ВЫХОДА: Если ссылка ведет на ДРУГОЙ домен
+                            if parsed_link.netloc != current_domain:
+                                # Добавляем в начало очереди (приоритетный переход во "внешний мир")
+                                queue.insert(0, link)
+                            else:
+                                # Ссылки внутри того же сайта добавляем в конец
+                                queue.append(link)
+                            
+                            links_from_page += 1
+                        
+                        # Ограничение: не берем более 20 ссылок с одной страницы
+                        # Это не даст боту "утонуть" в бесконечных страницах одного Хабра
+                        if links_from_page > 20:
+                            break
+                            
+            except Exception as e:
+                # Если сайт недоступен или возникла ошибка DNS, просто идем дальше
                 continue
-            await asyncio.sleep(0.2)  # Вежливый интервал
-
+            
+            # Небольшая пауза, чтобы не перегружать серверы и свой процессор
+            await asyncio.sleep(0.5)
 
 # --- UI HTML (ДИЗАЙН НЕ ТРОНУТ) ---
 HTML = """
