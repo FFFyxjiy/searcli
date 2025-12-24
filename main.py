@@ -7,244 +7,155 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-# --- CONFIGURATION ---
+# --- CONFIG ---
 TARGET_PAGES = 10000
 DB_NAME = "searcli_final_v1.db"
-STOP_WORDS = {"как", "что", "такое", "где", "это", "для", "под", "над", "в", "на", "и", "или", "быть", "с", "по", "ли"}
 
-# --- DATABASE MANAGER ---
 class DatabaseManager:
     def __init__(self, db_path=DB_NAME):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.execute('PRAGMA journal_mode=WAL')
-        self.conn.execute('PRAGMA synchronous=NORMAL')
         self.create_tables()
 
     def create_tables(self):
         cursor = self.conn.cursor()
-        cursor.execute('CREATE TABLE IF NOT EXISTS docs (id INTEGER PRIMARY KEY, url TEXT UNIQUE, title TEXT, views INTEGER, content TEXT)')
+        cursor.execute('CREATE TABLE IF NOT EXISTS docs (id INTEGER PRIMARY KEY, url TEXT UNIQUE, title TEXT, content TEXT)')
         cursor.execute('CREATE TABLE IF NOT EXISTS words (word TEXT, doc_id INTEGER, count INTEGER)')
-        cursor.execute('CREATE TABLE IF NOT EXISTS images (id INTEGER PRIMARY KEY, img_url TEXT UNIQUE, page_url TEXT, alt TEXT)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_word ON words(word)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_doc ON words(doc_id)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_w ON words(word)')
         self.conn.commit()
 
-    def add_all(self, url, title, words, text, images):
+    def add_all(self, url, title, words, text):
         cursor = self.conn.cursor()
         try:
-            cursor.execute("INSERT OR IGNORE INTO docs (url, title, views, content) VALUES (?, ?, ?, ?)", 
-                           (url, title, random.randint(1000, 5000), text))
-            row = cursor.execute("SELECT id FROM docs WHERE url=?", (url,)).fetchone()
-            if row:
-                doc_id = row[0]
-                cursor.executemany("INSERT INTO words VALUES (?, ?, ?)", [(w, doc_id, c) for w, c in words.items()])
-                for img_url, alt in images:
-                    cursor.execute("INSERT OR IGNORE INTO images (img_url, page_url, alt) VALUES (?, ?, ?)", (img_url, url, alt))
+            cursor.execute("INSERT OR IGNORE INTO docs (url, title, content) VALUES (?, ?, ?)", (url, title, text))
+            doc_id = cursor.execute("SELECT id FROM docs WHERE url=?", (url,)).fetchone()[0]
+            cursor.executemany("INSERT INTO words VALUES (?, ?, ?)", [(w, doc_id, c) for w, c in words.items()])
             self.conn.commit()
-        except: self.conn.rollback()
-
-    def get_suggestions(self, prefix):
-        if len(prefix) < 2: return []
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT DISTINCT word FROM words WHERE word LIKE ? LIMIT 5", (prefix.lower() + '%',))
-        return [r[0] for r in cursor.fetchall()]
+        except: pass
 
     def search_text(self, query):
         q_low = query.lower().strip()
-        q_words = re.findall(r'[a-zа-яё0-9]+', q_low) # Смягченный поиск
+        q_words = re.findall(r'[a-zа-яё0-9]+', q_low)
         if not q_words: return []
         cursor = self.conn.cursor()
         res = {}
         for word in q_words:
-            if word in STOP_WORDS and len(q_words) > 1: continue
-            cursor.execute('SELECT d.id, d.url, d.title, i.count, d.views, d.content FROM words i JOIN docs d ON i.doc_id = d.id WHERE i.word = ?', (word,))
-            for d_id, url, title, tf, v, content in cursor.fetchall():
-                t_low, u_low, c_low = (title or "").lower(), url.lower(), (content or "").lower()
-                score = (tf / (len(c_low)/1000 + 1)) * math.log(v + 1)
-                if word in t_low: score *= 25.0
-                if q_low in t_low: score *= 100.0
-                if q_low in u_low: score *= 60.0
-                if d_id not in res: res[d_id] = {'url': url, 'title': title or url, 'score': score, 'snippet': c_low[:180]}
+            cursor.execute('''SELECT d.id, d.url, d.title, i.count, d.content 
+                             FROM words i JOIN docs d ON i.doc_id = d.id WHERE i.word = ?''', (word,))
+            for d_id, url, title, tf, content in cursor.fetchall():
+                score = tf * 10
+                if word in (title or "").lower(): score += 100
+                if d_id not in res: res[d_id] = {'url': url, 'title': title or url, 'score': score, 'snippet': content[:180]}
                 else: res[d_id]['score'] += score
-        return sorted(res.values(), key=lambda x: x['score'], reverse=True)[:25]
-
-    def search_img(self, query):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT img_url, alt FROM images WHERE alt LIKE ? LIMIT 40", ('%' + query + '%',))
-        return cursor.fetchall()
+        return sorted(res.values(), key=lambda x: x['score'], reverse=True)[:20]
 
 db = DatabaseManager()
 
-# --- WIDGETS ---
+# --- СТАБИЛЬНЫЕ ВИДЖЕТЫ ---
 def get_widgets_data():
-    data = {"usd": "92.10", "eur": "99.20", "temp": "10", "city": "Москва", "idx": "0"}
+    data = {"usd": "91.45", "eur": "99.10", "temp": "—", "city": "Интернет", "idx": "0"}
     try:
-        geo = requests.get("https://ipapi.co/json/", timeout=2, headers={'User-Agent': 'Searcli/1.0'}).json()
-        if 'city' in geo:
-            data["city"] = geo['city']
-            lat, lon = geo.get('latitude', 55.75), geo.get('longitude', 37.61)
-            w_res = requests.get(f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true", timeout=2).json()
+        # Погода и город через более надежный API
+        geo = requests.get("https://ipwho.is/", timeout=3).json()
+        if geo.get('success'):
+            data["city"] = geo.get('city', 'Москва')
+            lat, lon = geo.get('latitude'), geo.get('longitude')
+            w_res = requests.get(f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true", timeout=3).json()
             data["temp"] = f"{int(round(w_res['current_weather']['temperature']))}"
-        r_c = requests.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=2).json()
-        data["usd"] = f"{r_c['Valute']['USD']['Value']:.2f}"
-        data["eur"] = f"{r_c['Valute']['EUR']['Value']:.2f}"
+        
+        # Курс валют (запасной источник)
+        cur = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=3).json()
+        data["usd"] = f"{cur['rates']['RUB']:.2f}"
+        data["eur"] = f"{cur['rates']['RUB'] / cur['rates']['EUR']:.2f}"
+        
         c = db.conn.cursor()
         data["idx"] = c.execute("SELECT count(*) FROM docs").fetchone()[0]
     except: pass
     return data
 
-def generate_smart_widget(query, results, w):
-    q = query.lower()
-    if "время" in q:
-        return f'<div class="smart-card"><div class="smart-label">ВРЕМЯ</div><div class="smart-val">{datetime.now().strftime("%H:%M")}</div><div class="smart-sub">{w["city"]}</div></div>'
-    if "погода" in q:
-        return f'<div class="smart-card"><div class="smart-label">ПОГОДА</div><div class="smart-val">{w["temp"]}°C</div><div class="smart-sub">{w["city"]}</div></div>'
-    if any(x in q for x in ["курс", "доллар", "евро"]):
-        return f'<div class="smart-card"><div class="smart-label">ВАЛЮТА</div><div style="display:flex;gap:30px;margin-top:10px;"><div><div style="font-size:24px;font-weight:bold;">{w["usd"]} ₽</div><div class="smart-sub">USD</div></div><div><div style="font-size:24px;font-weight:bold;">{w["eur"]} ₽</div><div class="smart-sub">EUR</div></div></div></div>'
-    if results and "wikipedia.org" in results[0]['url']:
-        r = results[0]
-        return f'<div class="smart-card" style="border-left:4px solid var(--primary)"><div class="smart-label">WIKIPEDIA</div><div style="font-size:22px;font-weight:bold;margin:10px 0">{r["title"].split(" — ")[0]}</div><p style="font-size:14px;color:#ccc;">{r["snippet"]}...</p><a href="{r["url"]}" target="_blank" class="smart-btn">Подробнее</a></div>'
-    return ""
-
-# --- CRAWLER ---
-async def crawler():
-    # Глобальные точки входа (хабы, где миллионы ссылок на разные сайты)
-    seeds = [
-        "https://www.google.com/search?q=news+tech+science+wiki", # Хитрость для зацепа
-        "https://dmoz-odp.org/",        # Огромный каталог ссылок на весь мир
-        "https://top100.rambler.ru/",   # Весь рунет
-        "https://www.reddit.com/r/all/", # Весь англоязычный интернет
-        "https://habr.com/ru/all/",
-        "https://en.wikipedia.org/wiki/Special:Random" # Прыжок в случайную точку мира
-    ]
-    
+# --- ГЛОБАЛЬНЫЙ КРАУЛЕР ---
+async def crawler_task():
+    seeds = ["https://ru.wikipedia.org/wiki/Брин,_Сергей", "https://news.yandex.ru", "https://habr.com", "https://www.rbc.ru"]
     queue, visited = list(seeds), set()
-    random.shuffle(queue)
-    
-    async with aiohttp.ClientSession(headers={'User-Agent': 'SearcliBot/1.0'}) as session:
+    async with aiohttp.ClientSession(headers={'User-Agent': 'Mozilla/5.0'}) as session:
         while queue and len(visited) < TARGET_PAGES:
             url = queue.pop(0)
-            if url in visited or not url.startswith('http'): continue
-            
+            if url in visited: continue
             try:
-                # Ставим небольшой таймаут, чтобы не зависать на медленных сайтах
-                async with session.get(url, timeout=4) as r:
+                async with session.get(url, timeout=5) as r:
                     if r.status != 200: continue
                     visited.add(url)
-                    
-                    html = await r.text(errors='ignore')
+                    html = await r.text()
                     soup = BeautifulSoup(html, 'html.parser')
+                    title = (soup.title.string or url).strip()
+                    text = soup.get_text(separator=' ')
+                    db.add_all(url, title, Counter(re.findall(r'[a-zа-яё0-9]+', text.lower())), text)
                     
-                    # Извлекаем данные
-                    t, txt = (soup.title.string or url).strip(), soup.get_text(separator=' ')
-                    db.add_all(url, t, Counter(re.findall(r'[a-zа-яё0-9]+', txt.lower())), txt, [])
-                    
-                    # ГЛОБАЛЬНАЯ СТРАТЕГИЯ:
-                    all_links = soup.find_all('a', href=True)
-                    external_links = []
-                    internal_links = []
-                    
-                    current_domain = urlparse(url).netloc
-                    
-                    for a in all_links:
+                    for a in soup.find_all('a', href=True):
                         link = urljoin(url, a['href'])
-                        parsed = urlparse(link)
-                        
-                        if parsed.netloc and link not in visited:
-                            # Если ссылка ведет на ДРУГОЙ сайт — это приоритет
-                            if parsed.netloc != current_domain:
-                                external_links.append(link)
-                            else:
-                                internal_links.append(link)
-                    
-                    # Перемешиваем, чтобы не зациклиться, и берем только самое важное
-                    random.shuffle(external_links)
-                    
-                    # Сначала идем на внешние сайты (расширяем кругозор)
-                    queue = external_links[:15] + queue + internal_links[:5]
-                    
-                    # Ограничиваем длину очереди, чтобы память не съело
-                    if len(queue) > 500: queue = queue[:500]
-
+                        if urlparse(link).netloc and link not in visited:
+                            queue.append(link)
+                        if len(queue) > 500: break
             except: continue
-            # Небольшая пауза, чтобы сайты не забанили твой IP
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.1) # Быстрый краулинг
 
-# --- INTERFACE ---
+def run_crawler_thread():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(crawler_task())
+
+# --- ИНТЕРФЕЙС LABRETTO ---
 HTML = """
 <!DOCTYPE html>
-<html lang="ru">
+<html>
 <head>
-    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta charset="UTF-8">
     <title>Searcli</title>
     <style>
-        :root { --bg: #0a0a0a; --text: #fff; --primary: #bb86fc; --border: #222; --sub: #888; }
-        body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); margin: 0; }
-        .container { max-width: 700px; margin: 0 auto; padding: 20px; display: flex; flex-direction: column; min-height: 100vh; }
-        .logo { font-size: 60px; font-weight: 200; color: #fff; text-decoration: none; letter-spacing: -2px; }
-        .dev-tag { font-size: 11px; color: #fff; font-weight: 200; letter-spacing: 3px; margin-top: -5px; opacity: 0.8; }
-        .search-box { position: relative; width: 100%; margin: 30px 0; }
-        .search-input { width: 100%; padding: 18px 28px; border-radius: 50px; border: 1px solid var(--border); background: #111; color: #fff; font-size: 17px; outline: none; box-sizing: border-box; }
-        .search-input:focus { border-color: var(--primary); }
-        .suggestions { position: absolute; top: 100%; left: 20px; right: 20px; background: #111; border: 1px solid var(--border); border-top: none; border-radius: 0 0 25px 25px; z-index: 100; display: none; }
-        .s-item { padding: 12px 25px; cursor: pointer; border-bottom: 1px solid #1a1a1a; }
-        .s-item:hover { background: #1a1a1a; color: var(--primary); }
-        .smart-card { background: #111; border: 1px solid var(--border); border-radius: 25px; padding: 25px; margin-bottom: 30px; animation: fadeInUp 0.4s ease; }
-        .smart-label { font-size: 10px; color: var(--primary); letter-spacing: 2px; font-weight: bold; }
-        .smart-val { font-size: 45px; font-weight: bold; margin: 10px 0; }
-        .smart-sub { color: var(--sub); font-size: 13px; }
-        .smart-btn { display: inline-block; margin-top: 15px; padding: 10px 22px; background: var(--primary); color: #000; border-radius: 12px; text-decoration: none; font-weight: bold; font-size: 13px; }
-        .res-item { margin-bottom: 35px; }
-        .res-link { color: var(--sub); font-size: 12px; text-decoration: none; display: block; margin-bottom: 5px; }
-        .res-title { color: #8ab4f8; font-size: 20px; text-decoration: none; }
-        .res-title:hover { text-decoration: underline; }
-        .widgets { display: flex; gap: 10px; margin-bottom: 20px; }
+        :root { --bg: #0a0a0a; --text: #fff; --primary: #bb86fc; --border: #222; }
+        body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 20px; }
+        .container { max-width: 700px; margin: 0 auto; }
+        .logo { font-size: 60px; font-weight: 200; color: #fff; text-decoration: none; letter-spacing: -2px; display: block; text-align: center; margin-top: 40px;}
+        .dev-tag { font-size: 11px; color: #fff; font-weight: 200; letter-spacing: 3px; text-align: center; opacity: 0.7; margin-bottom: 30px;}
+        .widgets { display: flex; gap: 10px; margin-bottom: 25px; }
         .w-card { background: #111; padding: 15px; border-radius: 20px; border: 1px solid var(--border); flex: 1; text-align: center; }
-        @keyframes fadeInUp { from { opacity: 0; transform: translateY(15px); } to { opacity: 1; transform: translateY(0); } }
+        .search-input { width: 100%; padding: 18px 25px; border-radius: 50px; border: 1px solid var(--border); background: #111; color: #fff; font-size: 17px; outline: none; box-sizing: border-box; }
+        .res-item { margin-top: 35px; border-bottom: 1px solid #1a1a1a; padding-bottom: 20px; }
+        .res-title { color: #8ab4f8; font-size: 20px; text-decoration: none; display: block; margin-bottom: 5px; }
+        .rating-box { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+        .rating-bar { height: 4px; background: #222; border-radius: 2px; flex-grow: 1; overflow: hidden; }
+        .rating-fill { height: 100%; background: var(--primary); }
     </style>
 </head>
 <body>
     <div class="container">
-        <center style="margin-top:60px">
-            <a href="/" class="logo">Searcli</a>
-            <div class="dev-tag">developer by Labretto</div>
-        </center>
+        <a href="/" class="logo">Searcli</a>
+        <div class="dev-tag">developer by Labretto</div>
 
-        <div class="widgets" style="margin-top:30px">
-            <div class="w-card"><div style="font-size:20px;font-weight:bold;">{{ w.temp }}°C</div><div style="font-size:9px;color:var(--sub);letter-spacing:1px;">{{ w.city|upper }}</div></div>
-            <div class="w-card"><div style="font-size:20px;font-weight:bold;">{{ w.usd }}₽</div><div style="font-size:9px;color:var(--sub);letter-spacing:1px;">USD</div></div>
-            <div class="w-card"><div style="font-size:20px;font-weight:bold;">{{ w.idx }}</div><div style="font-size:9px;color:var(--sub);letter-spacing:1px;">ИНДЕКС</div></div>
+        <div class="widgets">
+            <div class="w-card"><b>{{ w.temp }}°C</b><br><small style="color:#888">{{ w.city }}</small></div>
+            <div class="w-card"><b>{{ w.usd }}₽</b><br><small style="color:#888">USD</small></div>
+            <div class="w-card"><b>{{ w.idx }}</b><br><small style="color:#888">ИНДЕКС</small></div>
         </div>
 
-        <div class="search-box">
-            <form action="/search"><input id="q" name="q" class="search-input" placeholder="Найти..." autocomplete="off" value="{{ q }}" required></form>
-            <div id="s-box" class="suggestions"></div>
-        </div>
+        <form action="/search">
+            <input name="q" class="search-input" placeholder="Найти в глобальной сети..." value="{{ q }}" required>
+        </form>
 
-        <div style="width:100%">
-            {{ smart|safe }}
-            {% for r in results %}
-            <div class="res-item">
-                <a href="{{ r.url }}" class="res-link" target="_blank">{{ r.url[:70] }}</a>
-                <a href="{{ r.url }}" class="res-title" target="_blank">{{ r.title }}</a>
-                <div style="color:var(--sub);font-size:14px;margin-top:5px;">{{ r.snippet }}...</div>
+        {% if smart %}<div style="background:#111; padding:20px; border-radius:25px; margin-top:20px; border:1px solid var(--primary)">{{ smart|safe }}</div>{% endif %}
+
+        {% for r in results %}
+        <div class="res-item">
+            <small style="color:#888">{{ r.url[:60] }}</small>
+            <a href="{{ r.url }}" class="res-title" target="_blank">{{ r.title }}</a>
+            <div style="color:#aaa; font-size:14px">{{ r.snippet }}...</div>
+            <div class="rating-box">
+                <span style="font-size:10px; color:var(--primary)">RANK</span>
+                <div class="rating-bar"><div class="rating-fill" style="width:{{ [r.score/5, 100]|min }}%"></div></div>
             </div>
-            {% endfor %}
         </div>
-        <div style="margin: auto 0 30px; text-align: center; font-size: 10px; color: var(--sub); letter-spacing: 5px; opacity: 0.4;">LABRETTO SEARCLI 1.0</div>
+        {% endfor %}
     </div>
-    <script>
-        const qI = document.getElementById('q'), sB = document.getElementById('s-box');
-        qI.oninput = async () => {
-            if (qI.value.length < 2) { sB.style.display = 'none'; return; }
-            const r = await fetch(`/suggest?p=${encodeURIComponent(qI.value)}`), data = await r.json();
-            if (data.length) {
-                sB.innerHTML = data.map(w => `<div class="s-item">${w}</div>`).join('');
-                sB.style.display = 'block';
-                document.querySelectorAll('.s-item').forEach(el => el.onclick = () => { qI.value = el.innerText; qI.closest('form').submit(); });
-            } else sB.style.display = 'none';
-        };
-    </script>
 </body>
 </html>
 """
@@ -253,19 +164,19 @@ HTML = """
 def home():
     return render_template_string(HTML, q="", results=[], w=get_widgets_data(), smart="")
 
-@app.route('/suggest')
-def suggest():
-    return jsonify(db.get_suggestions(request.args.get('p', '')))
-
 @app.route('/search')
 def search():
     q = request.args.get('q', '')
-    w_data = get_widgets_data()
+    w = get_widgets_data()
     res = db.search_text(q)
-    smart = generate_smart_widget(q, res, w_data)
-    return render_template_string(HTML, q=q, results=res, w=w_data, smart=smart)
+    
+    # Смарт-виджет для Википедии
+    smart = ""
+    if res and "wikipedia.org" in res[0]['url']:
+        smart = f"<b>Инсайт из Википедии:</b><br>{res[0]['snippet']}... <br><a href='{res[0]['url']}' style='color:var(--primary)'>Читать полностью</a>"
+    
+    return render_template_string(HTML, q=q, results=res, w=w, smart=smart)
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 10000))
-    threading.Thread(target=lambda: asyncio.run(crawler()), daemon=True).start()
-    app.run(host='0.0.0.0', port=port)
+    threading.Thread(target=run_crawler_thread, daemon=True).start()
+    app.run(host='0.0.0.0', port=10000)
