@@ -1,5 +1,5 @@
 import asyncio, aiohttp, math, re, sqlite3, random, threading, requests, os
-from flask import Flask, render_template_string, request
+from flask import Flask, render_template_string, request, jsonify
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
 from collections import Counter
@@ -14,7 +14,8 @@ STOP_WORDS = {"как", "что", "такое", "где", "это", "для", "�
 class DatabaseManager:
     def __init__(self, db_path=DB_NAME):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.execute('PRAGMA journal_mode=WAL') # Режим для ускорения работы
+        # WAL-режим позволяет одновременно читать и писать в базу без ошибок
+        self.conn.execute('PRAGMA journal_mode=WAL')
         self.create_tables()
 
     def create_tables(self):
@@ -23,6 +24,7 @@ class DatabaseManager:
         cursor.execute('CREATE TABLE IF NOT EXISTS words (word TEXT, doc_id INTEGER, count INTEGER)')
         cursor.execute('CREATE TABLE IF NOT EXISTS images (id INTEGER PRIMARY KEY, img_url TEXT UNIQUE, page_url TEXT, alt TEXT)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_w ON words(word)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_doc_id ON words(doc_id)')
         self.conn.commit()
 
     def add_all(self, url, title, words, text, images):
@@ -37,7 +39,14 @@ class DatabaseManager:
                 for img_url, alt in images:
                     cursor.execute("INSERT OR IGNORE INTO images (img_url, page_url, alt) VALUES (?, ?, ?)", (img_url, url, alt))
             self.conn.commit()
-        except: pass
+        except: self.conn.rollback()
+
+    def get_suggestions(self, prefix):
+        if len(prefix) < 2: return []
+        cursor = self.conn.cursor()
+        # Ищем уникальные слова, начинающиеся на введенные буквы
+        cursor.execute("SELECT DISTINCT word FROM words WHERE word LIKE ? LIMIT 5", (prefix.lower() + '%',))
+        return [r[0] for r in cursor.fetchall()]
 
     def search_text(self, query):
         q_low = query.lower().strip()
@@ -64,7 +73,7 @@ class DatabaseManager:
 db = DatabaseManager()
 
 def get_widgets():
-    data = {"usd": "78.50", "temp": "0", "idx": "0"}
+    data = {"usd": "00.00", "temp": "0", "idx": "0"}
     try:
         r1 = requests.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=1).json()
         data["usd"] = f"{r1['Valute']['USD']['Value']:.2f}"
@@ -91,11 +100,11 @@ async def crawler():
                     title = (soup.title.string or url).strip()
                     imgs = [(urljoin(url, i['src']), i.get('alt','')) for i in soup.find_all('img', src=True) if len(i.get('alt','')) > 3][:10]
                     db.add_all(url, title, Counter(re.findall(r'[a-zа-яё0-9]{3,}', text.lower())), text, imgs)
-                    for a in soup.find_all('a', href=True)[:15]:
+                    for a in soup.find_all('a', href=True)[:10]:
                         l = urljoin(url, a['href'])
                         if urlparse(l).netloc and l not in visited: queue.append(l)
             except: continue
-            await asyncio.sleep(1) # Даем серверу "подышать"
+            await asyncio.sleep(1.5) # Вежливая задержка для Render
 
 HTML = """
 <!DOCTYPE html>
@@ -111,7 +120,11 @@ HTML = """
         .logo { font-size: 72px; font-weight: 500; color: var(--primary); text-decoration: none; }
         .widgets { display: flex; gap: 10px; margin-bottom: 30px; }
         .widget { background: #1e1e1e; padding: 15px; border-radius: 15px; text-align: center; border: 1px solid var(--border); min-width: 80px; }
-        .search-input { width: 100%; max-width: 600px; padding: 15px 25px; border-radius: 50px; border: 1px solid var(--border); background: #1e1e1e; color: var(--text); font-size: 18px; outline: none; }
+        .search-box { width: 100%; max-width: 600px; position: relative; }
+        .search-input { width: 100%; padding: 15px 25px; border-radius: 50px; border: 1px solid var(--border); background: #1e1e1e; color: var(--text); font-size: 18px; outline: none; box-sizing: border-box; }
+        .suggestions { position: absolute; top: 100%; left: 20px; right: 20px; background: #1e1e1e; border: 1px solid var(--border); border-top: none; border-radius: 0 0 15px 15px; z-index: 100; display: none; overflow: hidden; }
+        .suggestion-item { padding: 12px 20px; cursor: pointer; border-bottom: 1px solid #222; }
+        .suggestion-item:hover { background: #2a2a2a; color: var(--primary); }
         .tabs { margin: 20px 0; display: flex; gap: 20px; }
         .tab { text-decoration: none; color: var(--sub); font-size: 14px; }
         .tab.active { color: var(--primary); font-weight: bold; border-bottom: 2px solid var(--primary); }
@@ -134,17 +147,23 @@ HTML = """
             <div class="widget"><div style="font-weight:bold">{{ w.usd }} ₽</div><div style="font-size:10px">USD/RUB</div></div>
             <div class="widget"><div style="font-weight:bold">{{ w.idx }}</div><div style="font-size:10px">ИНДЕКС</div></div>
         </div>{% endif %}
-        <form action="/search" style="width:100%; text-align:center;">
-            <input name="q" class="search-input" placeholder="Поиск..." value="{{ q }}" required>
-            <input type="hidden" name="t" value="{{ t }}">
-        </form>
+        
+        <div class="search-box">
+            <form action="/search">
+                <input id="q" name="q" class="search-input" placeholder="Поиск..." autocomplete="off" value="{{ q }}" required>
+                <input type="hidden" name="t" value="{{ t }}">
+            </form>
+            <div id="suggest-box" class="suggestions"></div>
+        </div>
+
         {% if q %}<div class="tabs">
             <a href="/search?q={{q}}&t=text" class="tab {% if t!='img' %}active{% endif %}">Все</a>
             <a href="/search?q={{q}}&t=img" class="tab {% if t=='img' %}active{% endif %}">Картинки</a>
         </div>{% endif %}
+
         <div style="width:100%">
             {% if t == 'img' %}<div class="img-grid">
-                {% for i in results %}<div class="img-card"><a href="{{ i[0] }}" target="_blank"><img src="{{ i[0] }}"></a></div>{% endfor %}
+                {% for i in results %}<div class="img-card"><a href="{{ i[0] }}" target="_blank"><img src="{{ i[0] }}" loading="lazy"></a></div>{% endfor %}
             </div>{% else %}
                 {% for r in results %}<div class="res-item">
                     <a href="{{ r.url }}" class="res-title" target="_blank">{{ r.title }}</a>
@@ -158,6 +177,34 @@ HTML = """
         </div>
         <div style="margin-top: auto; padding: 40px 0; font-size: 10px; font-weight: 300; letter-spacing: 3px; opacity: 0.5;">Searcli 1.0</div>
     </div>
+
+    <script>
+        const qInput = document.getElementById('q');
+        const sBox = document.getElementById('suggest-box');
+
+        qInput.addEventListener('input', async () => {
+            const val = qInput.value;
+            if (val.length < 2) { sBox.style.display = 'none'; return; }
+            
+            const res = await fetch(`/suggest?p=${encodeURIComponent(val)}`);
+            const words = await res.json();
+            
+            if (words.length > 0) {
+                sBox.innerHTML = words.map(w => `<div class="suggestion-item">${w}</div>`).join('');
+                sBox.style.display = 'block';
+                document.querySelectorAll('.suggestion-item').forEach(item => {
+                    item.onclick = () => {
+                        qInput.value = item.innerText;
+                        qInput.closest('form').submit();
+                    };
+                });
+            } else { sBox.style.display = 'none'; }
+        });
+
+        document.addEventListener('click', (e) => {
+            if (e.target !== qInput) sBox.style.display = 'none';
+        });
+    </script>
 </body>
 </html>
 """
@@ -165,6 +212,11 @@ HTML = """
 @app.route('/')
 def home():
     return render_template_string(HTML, q="", t="text", results=[], w=get_widgets())
+
+@app.route('/suggest')
+def suggest():
+    prefix = request.args.get('p', '')
+    return jsonify(db.get_suggestions(prefix))
 
 @app.route('/search')
 def search():
