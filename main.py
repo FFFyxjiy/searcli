@@ -45,26 +45,44 @@ class DatabaseManager:
         except Exception:
             self.conn.rollback()
 
-    def search_text(self, query):
-        q_words = [w for w in re.findall(r'[a-zа-яё0-9]{3,}', query.lower()) if w not in STOP_WORDS]
+   def search_text(self, query):
+        # Очистка запроса
+        q_raw = query.lower().strip()
+        q_words = [w for w in re.findall(r'[a-zа-яё0-9]{3,}', q_raw) if w not in STOP_WORDS]
         if not q_words: return []
+        
         cursor = self.conn.cursor()
         res = {}
+        
         for word in q_words:
-            cursor.execute('SELECT d.id, d.url, d.title, i.count, d.views, d.content FROM words i JOIN docs d ON i.doc_id = d.id WHERE i.word = ?', (word,))
+            # Ищем документы, содержащие слова запроса
+            cursor.execute('''SELECT d.id, d.url, d.title, i.count, d.views, d.content 
+                              FROM words i JOIN docs d ON i.doc_id = d.id WHERE i.word = ?''', (word,))
+            
             for d_id, url, title, tf, v, content in cursor.fetchall():
-                # УЛУЧШЕННЫЙ АЛГОРИТМ:
-                # Огромный бонус (x10) если слово в заголовке
-                title_bonus = 10.0 if word in (title or "").lower() else 1.0
-                # Бонус за популярность (просмотры) и плотность слова
-                score = (math.log(tf + 1) * 2 + math.log(v + 1)) * title_bonus
+                low_title = (title or "").lower()
+                low_content = (content or "").lower()
+                
+                # 1. Базовый скоринг (TF-IDF + Views)
+                score = (math.log(tf + 1) * 2 + math.log(v + 1))
+                
+                # 2. Бонус за вхождение в заголовок (X15)
+                if word in low_title:
+                    score *= 15.0
+                
+                # 3. КРИТИЧЕСКИЙ БОНУС: Совпадение всей фразы (например, "Сергей Брин")
+                # Если фраза целиком есть в заголовке — это почти 100% попадание
+                if q_raw in low_title:
+                    score *= 50.0
+                elif q_raw in low_content:
+                    score *= 10.0
                 
                 if d_id not in res: 
-                    res[d_id] = {'url': url, 'title': title or url, 'score': score, 'snippet': (content or "")[:160]}
+                    res[d_id] = {'url': url, 'title': title or url, 'score': score, 'snippet': (content or "")[:200]}
                 else: 
                     res[d_id]['score'] += score
         
-        # Сортируем: сначала самые релевантные
+        # Сортировка по финальному баллу
         return sorted(res.values(), key=lambda x: x['score'], reverse=True)
 
     def search_img(self, query):
@@ -92,8 +110,18 @@ def get_widgets():
 
 
 async def crawler():
-    seeds = ["https://habr.com/ru/", "https://www.rbc.ru/", "https://ru.wikipedia.org/wiki/Заглавная_страница",
-             "https://unsplash.com/"]
+    # Мы добавляем мировые порталы, откуда ссылки ведут на миллионы других сайтов
+    seeds = [
+        "https://ru.wikipedia.org/wiki/Список_крупнейших_IT-компаний",
+        "https://dmoz-odp.org/", # Открытый каталог ссылок
+        "https://www.reuters.com/",
+        "https://news.google.com/",
+        "https://www.nytimes.com/",
+        "https://www.youtube.com/",
+        "https://www.ya.com/",
+        "https://habr.com/ru/all/",
+        "https://ru.wikipedia.org/wiki/Служебная:RecentChanges" # Постоянно новые ссылки
+    ]
     q, visited = list(seeds), set()
     async with aiohttp.ClientSession(headers={'User-Agent': 'SearcliBot/2.0 (by Labretto)'}) as session:
         while q and len(visited) < TARGET_PAGES:
