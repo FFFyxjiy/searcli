@@ -46,44 +46,60 @@ class DatabaseManager:
             self.conn.rollback()
 
    def search_text(self, query):
-        # Очистка запроса
-        q_raw = query.lower().strip()
-        q_words = [w for w in re.findall(r'[a-zа-яё0-9]{3,}', q_raw) if w not in STOP_WORDS]
-        if not q_words: return []
+        # 1. Подготовка запроса
+        query_low = query.lower().strip()
+        # Извлекаем слова (минимум 3 символа)
+        q_words = [w for w in re.findall(r'[a-zа-яё0-9]{3,}', query_low) if w not in STOP_WORDS]
         
+        if not q_words:
+            return []
+
         cursor = self.conn.cursor()
         res = {}
-        
+
+        # 2. Поиск по каждому слову
         for word in q_words:
-            # Ищем документы, содержащие слова запроса
-            cursor.execute('''SELECT d.id, d.url, d.title, i.count, d.views, d.content 
-                              FROM words i JOIN docs d ON i.doc_id = d.id WHERE i.word = ?''', (word,))
+            cursor.execute('''
+                SELECT d.id, d.url, d.title, i.count, d.views, d.content 
+                FROM words i 
+                JOIN docs d ON i.doc_id = d.id 
+                WHERE i.word = ?
+            ''', (word,))
             
-            for d_id, url, title, tf, v, content in cursor.fetchall():
-                low_title = (title or "").lower()
-                low_content = (content or "").lower()
+            rows = cursor.fetchall()
+            for d_id, url, title, tf, v, content in rows:
+                # Защита от пустых значений
+                curr_title = (title or "").lower()
+                curr_content = (content or "").lower()
                 
-                # 1. Базовый скоринг (TF-IDF + Views)
+                # Базовый вес: частота слова + логарифм просмотров
                 score = (math.log(tf + 1) * 2 + math.log(v + 1))
                 
-                # 2. Бонус за вхождение в заголовок (X15)
-                if word in low_title:
-                    score *= 15.0
-                
-                # 3. КРИТИЧЕСКИЙ БОНУС: Совпадение всей фразы (например, "Сергей Брин")
-                # Если фраза целиком есть в заголовке — это почти 100% попадание
-                if q_raw in low_title:
-                    score *= 50.0
-                elif q_raw in low_content:
-                    score *= 10.0
-                
-                if d_id not in res: 
-                    res[d_id] = {'url': url, 'title': title or url, 'score': score, 'snippet': (content or "")[:200]}
-                else: 
+                # Бонус за слово в заголовке
+                if word in curr_title:
+                    score *= 5.0
+
+                # --- ИСПРАВЛЕНИЕ ОШИБКИ: ПРОВЕРКА ЦЕЛОЙ ФРАЗЫ ---
+                # Если в документе слова идут ровно так, как ввел пользователь
+                if len(q_words) > 1 and query_low in curr_title:
+                    score *= 40.0  # Огромный приоритет за точное совпадение в заголовке
+                elif len(q_words) > 1 and query_low in curr_content:
+                    score *= 10.0  # Хороший бонус за совпадение фразы в тексте
+
+                if d_id not in res:
+                    res[d_id] = {
+                        'url': url, 
+                        'title': title or url, 
+                        'score': score, 
+                        'snippet': self.gen_snip(content or "", q_words)
+                    }
+                else:
+                    # Если документ уже найден по другому слову из запроса, прибавляем очки
                     res[d_id]['score'] += score
-        
-        # Сортировка по финальному баллу
-        return sorted(res.values(), key=lambda x: x['score'], reverse=True)
+
+        # 3. Финальная сортировка по убыванию рейтинга
+        final_results = sorted(res.values(), key=lambda x: x['score'], reverse=True)
+        return final_results
 
     def search_img(self, query):
         if not query: return []
