@@ -51,15 +51,20 @@ class DatabaseManager:
         cursor = self.conn.cursor()
         res = {}
         for word in q_words:
-            cursor.execute(
-                'SELECT d.id, d.url, d.title, i.count, d.views, d.content FROM words i JOIN docs d ON i.doc_id = d.id WHERE i.word = ?',
-                (word,))
+            cursor.execute('SELECT d.id, d.url, d.title, i.count, d.views, d.content FROM words i JOIN docs d ON i.doc_id = d.id WHERE i.word = ?', (word,))
             for d_id, url, title, tf, v, content in cursor.fetchall():
-                score = (math.log(tf + 1) * math.log(v + 1)) * (4.0 if word in (title or "").lower() else 1.0)
-                if d_id not in res:
+                # УЛУЧШЕННЫЙ АЛГОРИТМ:
+                # Огромный бонус (x10) если слово в заголовке
+                title_bonus = 10.0 if word in (title or "").lower() else 1.0
+                # Бонус за популярность (просмотры) и плотность слова
+                score = (math.log(tf + 1) * 2 + math.log(v + 1)) * title_bonus
+                
+                if d_id not in res: 
                     res[d_id] = {'url': url, 'title': title or url, 'score': score, 'snippet': (content or "")[:160]}
-                else:
+                else: 
                     res[d_id]['score'] += score
+        
+        # Сортируем: сначала самые релевантные
         return sorted(res.values(), key=lambda x: x['score'], reverse=True)
 
     def search_img(self, query):
@@ -239,6 +244,9 @@ HTML = """
                 </div>
             </div>{% endfor %}
         </div>{% endif %}
+    </div>
+<div style="text-align: center; margin-top: 50px; padding-bottom: 20px; font-size: 10px; font-weight: 300; color: var(--sub); letter-spacing: 2px; opacity: 0.6;">
+        Searcli 1.0
     </div>
 </body>
 </html>
