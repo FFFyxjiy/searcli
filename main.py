@@ -84,8 +84,7 @@ def get_widgets_data():
     except: pass
     return data
 
-async def crawler():
-    # Глобальные точки входа (хабы, где миллионы ссылок на разные сайты)
+async def crawler_task():
     seeds = [
         "https://www.google.com/search?q=news+tech+science+wiki", # Хитрость для зацепа
         "https://dmoz-odp.org/",        # Огромный каталог ссылок на весь мир
@@ -94,59 +93,25 @@ async def crawler():
         "https://habr.com/ru/all/",
         "https://en.wikipedia.org/wiki/Special:Random" # Прыжок в случайную точку мира
     ]
-    
     queue, visited = list(seeds), set()
-    random.shuffle(queue)
-    
-    async with aiohttp.ClientSession(headers={'User-Agent': 'SearcliBot/1.0'}) as session:
+    async with aiohttp.ClientSession(headers={'User-Agent': 'Mozilla/5.0'}) as session:
         while queue and len(visited) < TARGET_PAGES:
             url = queue.pop(0)
-            if url in visited or not url.startswith('http'): continue
-            
+            if url in visited: continue
             try:
-                # Ставим небольшой таймаут, чтобы не зависать на медленных сайтах
-                async with session.get(url, timeout=4) as r:
+                async with session.get(url, timeout=5) as r:
                     if r.status != 200: continue
                     visited.add(url)
-                    
-                    html = await r.text(errors='ignore')
-                    soup = BeautifulSoup(html, 'html.parser')
-                    
-                    # Извлекаем данные
+                    soup = BeautifulSoup(await r.text(errors='ignore'), 'html.parser')
+                    for s in soup(["script", "style"]): s.decompose()
                     t, txt = (soup.title.string or url).strip(), soup.get_text(separator=' ')
-                    db.add_all(url, t, Counter(re.findall(r'[a-zа-яё0-9]+', txt.lower())), txt, [])
-                    
-                    # ГЛОБАЛЬНАЯ СТРАТЕГИЯ:
-                    all_links = soup.find_all('a', href=True)
-                    external_links = []
-                    internal_links = []
-                    
-                    current_domain = urlparse(url).netloc
-                    
-                    for a in all_links:
+                    db.add_all(url, t, Counter(re.findall(r'[a-zа-яё0-9]+', txt.lower())), txt)
+                    for a in soup.find_all('a', href=True):
                         link = urljoin(url, a['href'])
-                        parsed = urlparse(link)
-                        
-                        if parsed.netloc and link not in visited:
-                            # Если ссылка ведет на ДРУГОЙ сайт — это приоритет
-                            if parsed.netloc != current_domain:
-                                external_links.append(link)
-                            else:
-                                internal_links.append(link)
-                    
-                    # Перемешиваем, чтобы не зациклиться, и берем только самое важное
-                    random.shuffle(external_links)
-                    
-                    # Сначала идем на внешние сайты (расширяем кругозор)
-                    queue = external_links[:15] + queue + internal_links[:5]
-                    
-                    # Ограничиваем длину очереди, чтобы память не съело
-                    if len(queue) > 500: queue = queue[:500]
-
+                        if urlparse(link).netloc and link not in visited: queue.append(link)
+                        if len(queue) > 1000: break
             except: continue
-            # Небольшая пауза, чтобы сайты не забанили твой IP
-            await asyncio.sleep(0.5)
-
+            await asyncio.sleep(0.1)
 HTML = """
 <!DOCTYPE html>
 <html lang="ru">
