@@ -311,7 +311,8 @@ def search():
 
 
 if __name__ == '__main__':
-    # Запуск краулера в отдельном демоническом потоке
+    import os
+    # Порт берется из настроек сервера или ставится 10000 по умолчанию
+    port = int(os.environ.get("PORT", 10000))
     threading.Thread(target=lambda: asyncio.run(crawler()), daemon=True).start()
-    # Запуск Flask. host='0.0.0.0' делает его доступным в локальной сети
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    app.run(host='0.0.0.0', port=port)
