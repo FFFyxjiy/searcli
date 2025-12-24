@@ -45,67 +45,69 @@ class DatabaseManager:
         except Exception:
             self.conn.rollback()
 
-   def search_text(self, query):
-        # 1. Подготовка запроса
-        query_low = query.lower().strip()
-        # Извлекаем слова (минимум 3 символа)
-        q_words = [w for w in re.findall(r'[a-zа-яё0-9]{3,}', query_low) if w not in STOP_WORDS]
-        
-        if not q_words:
-            return []
 
-        cursor = self.conn.cursor()
-        res = {}
+def search_text(self, query):
+    # 1. Подготовка запроса
+    query_low = query.lower().strip()
+    # Извлекаем слова (минимум 3 символа)
+    q_words = [w for w in re.findall(r'[a-zа-яё0-9]{3,}', query_low) if w not in STOP_WORDS]
 
-        # 2. Поиск по каждому слову
-        for word in q_words:
-            cursor.execute('''
-                SELECT d.id, d.url, d.title, i.count, d.views, d.content 
-                FROM words i 
-                JOIN docs d ON i.doc_id = d.id 
-                WHERE i.word = ?
-            ''', (word,))
-            
-            rows = cursor.fetchall()
-            for d_id, url, title, tf, v, content in rows:
-                # Защита от пустых значений
-                curr_title = (title or "").lower()
-                curr_content = (content or "").lower()
-                
-                # Базовый вес: частота слова + логарифм просмотров
-                score = (math.log(tf + 1) * 2 + math.log(v + 1))
-                
-                # Бонус за слово в заголовке
-                if word in curr_title:
-                    score *= 5.0
+    if not q_words:
+        return []
 
-                # --- ИСПРАВЛЕНИЕ ОШИБКИ: ПРОВЕРКА ЦЕЛОЙ ФРАЗЫ ---
-                # Если в документе слова идут ровно так, как ввел пользователь
-                if len(q_words) > 1 and query_low in curr_title:
-                    score *= 40.0  # Огромный приоритет за точное совпадение в заголовке
-                elif len(q_words) > 1 and query_low in curr_content:
-                    score *= 10.0  # Хороший бонус за совпадение фразы в тексте
+    cursor = self.conn.cursor()
+    res = {}
 
-                if d_id not in res:
-                    res[d_id] = {
-                        'url': url, 
-                        'title': title or url, 
-                        'score': score, 
-                        'snippet': self.gen_snip(content or "", q_words)
-                    }
-                else:
-                    # Если документ уже найден по другому слову из запроса, прибавляем очки
-                    res[d_id]['score'] += score
+    # 2. Поиск по каждому слову
+    for word in q_words:
+        cursor.execute('''
+                       SELECT d.id, d.url, d.title, i.count, d.views, d.content
+                       FROM words i
+                                JOIN docs d ON i.doc_id = d.id
+                       WHERE i.word = ?
+                       ''', (word,))
 
-        # 3. Финальная сортировка по убыванию рейтинга
-        final_results = sorted(res.values(), key=lambda x: x['score'], reverse=True)
-        return final_results
+        rows = cursor.fetchall()
+        for d_id, url, title, tf, v, content in rows:
+            # Защита от пустых значений
+            curr_title = (title or "").lower()
+            curr_content = (content or "").lower()
 
-    def search_img(self, query):
-        if not query: return []
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT img_url, alt FROM images WHERE alt LIKE ? LIMIT 50", ('%' + query + '%',))
-        return cursor.fetchall()
+            # Базовый вес: частота слова + логарифм просмотров
+            score = (math.log(tf + 1) * 2 + math.log(v + 1))
+
+            # Бонус за слово в заголовке
+            if word in curr_title:
+                score *= 5.0
+
+            # --- ИСПРАВЛЕНИЕ ОШИБКИ: ПРОВЕРКА ЦЕЛОЙ ФРАЗЫ ---
+            # Если в документе слова идут ровно так, как ввел пользователь
+            if len(q_words) > 1 and query_low in curr_title:
+                score *= 40.0  # Огромный приоритет за точное совпадение в заголовке
+            elif len(q_words) > 1 and query_low in curr_content:
+                score *= 10.0  # Хороший бонус за совпадение фразы в тексте
+
+            if d_id not in res:
+                res[d_id] = {
+                    'url': url,
+                    'title': title or url,
+                    'score': score,
+                    'snippet': self.gen_snip(content or "", q_words)
+                }
+            else:
+                # Если документ уже найден по другому слову из запроса, прибавляем очки
+                res[d_id]['score'] += score
+
+    # 3. Финальная сортировка по убыванию рейтинга
+    final_results = sorted(res.values(), key=lambda x: x['score'], reverse=True)
+    return final_results
+
+
+def search_img(self, query):
+    if not query: return []
+    cursor = self.conn.cursor()
+    cursor.execute("SELECT img_url, alt FROM images WHERE alt LIKE ? LIMIT 50", ('%' + query + '%',))
+    return cursor.fetchall()
 
 
 db = DatabaseManager()
@@ -128,15 +130,14 @@ def get_widgets():
 async def crawler():
     # Мы добавляем мировые порталы, откуда ссылки ведут на миллионы других сайтов
     seeds = [
-        "https://ru.wikipedia.org/wiki/Список_крупнейших_IT-компаний",
-        "https://dmoz-odp.org/", # Открытый каталог ссылок
+        "https://dmoz-odp.org/",  # Открытый каталог ссылок
         "https://www.reuters.com/",
         "https://news.google.com/",
         "https://www.nytimes.com/",
         "https://www.youtube.com/",
         "https://www.ya.com/",
         "https://habr.com/ru/all/",
-        "https://ru.wikipedia.org/wiki/Служебная:RecentChanges" # Постоянно новые ссылки
+        "https://ru.wikipedia.org/"  # Постоянно новые ссылки
     ]
     q, visited = list(seeds), set()
     async with aiohttp.ClientSession(headers={'User-Agent': 'SearcliBot/2.0 (by Labretto)'}) as session:
@@ -195,7 +196,7 @@ HTML = """
         }
 
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 0; overflow-x: hidden; }
-        
+
         .container { 
             width: 100%; max-width: 800px; margin: 0 auto; padding: 15px; 
             box-sizing: border-box; display: flex; flex-direction: column; align-items: center; 
