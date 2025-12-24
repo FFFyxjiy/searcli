@@ -50,20 +50,55 @@ class DatabaseManager:
 
     def search_text(self, query):
         q_low = query.lower().strip()
+        # Разбиваем на слова и убираем мусор
         q_words = [w for w in re.findall(r'[a-zа-яё0-9]{3,}', q_low) if w not in STOP_WORDS]
         if not q_words: return []
+        
         cursor = self.conn.cursor()
         res = {}
+        
         for word in q_words:
-            cursor.execute('SELECT d.id, d.url, d.title, i.count, d.views, d.content FROM words i JOIN docs d ON i.doc_id = d.id WHERE i.word = ?', (word,))
+            # Ищем документы, где есть это слово
+            cursor.execute('''
+                SELECT d.id, d.url, d.title, i.count, d.views, d.content 
+                FROM words i 
+                JOIN docs d ON i.doc_id = d.id 
+                WHERE i.word = ?''', (word,))
+            
             for d_id, url, title, tf, v, content in cursor.fetchall():
                 t_low = (title or "").lower()
-                score = (math.log(tf + 1) * 2 + math.log(v + 1))
-                if word in t_low: score *= 10.0
-                if q_low in t_low: score *= 50.0
-                if d_id not in res: res[d_id] = {'url': url, 'title': title or url, 'score': score, 'snippet': (content or "")[:150]}
-                else: res[d_id]['score'] += score
-        return sorted(res.values(), key=lambda x: x['score'], reverse=True)
+                c_low = (content or "").lower()
+                
+                # 1. Базовый вес (TF-IDF логика)
+                # Мы делим частоту слова на общую длину текста, чтобы огромные "простыни" новостей не побеждали
+                score = (tf / (len(c_low) / 1000 + 1)) * math.log(v + 1)
+                
+                # 2. ОГРОМНЫЙ БОНУС за слово в заголовке (x20)
+                if word in t_low:
+                    score *= 20.0
+                
+                # 3. КРИТИЧЕСКИЙ БОНУС за точную фразу (например, "Сергей Брин")
+                if q_low in t_low:
+                    score *= 100.0  # Это гарантирует, что Википедия будет выше новостей
+                elif q_low in c_low:
+                    score *= 10.0
+                
+                # 4. ШТРАФ за "мусорные" URL (новости, агрегаторы)
+                if "news" in url or "rbc" in url:
+                    score *= 0.5
+
+                if d_id not in res:
+                    res[d_id] = {
+                        'url': url, 
+                        'title': title or url, 
+                        'score': score, 
+                        'snippet': (content or "")[:150]
+                    }
+                else:
+                    res[d_id]['score'] += score
+        
+        # Сортируем и отдаем ТОП-20
+        return sorted(res.values(), key=lambda x: x['score'], reverse=True)[:20]
 
     def search_img(self, query):
         cursor = self.conn.cursor()
@@ -85,27 +120,94 @@ def get_widgets():
     return data
 
 async def crawler():
-    seeds = ["https://ru.wikipedia.org/wiki/Служебная:Random", "https://news.google.com/", "https://www.rbc.ru/"]
+    # Глобальные "ворота" в интернет для максимального масштаба
+    seeds = [
+        # Знания и энциклопедии
+        "https://ru.wikipedia.org/wiki/Служебная:Random",
+        "https://en.wikipedia.org/wiki/Special:Random",
+        "https://ru.citizendium.org/wiki/Main_Page",
+        
+        # Наука и технологии
+        "https://arxiv.org/",              # Крупнейший архив научных статей
+        "https://habr.com/ru/all/",        # IT-сообщество
+        "https://github.com/trending",     # Тренды программирования
+        
+        # Мировые новости и архивы
+        "https://www.reuters.com/",        # Мировое агентство новостей
+        "https://www.interfax.ru/",        # Главные новости СНГ
+        "https://www.bbc.com/russian",
+        
+        # Каталоги (дают ссылки на тысячи мелких сайтов)
+        "https://dmoz-odp.org/",           # Open Directory Project
+        "https://www.lenta.ru/",
+        "https://www.gutenberg.org/"       # Библиотека бесплатных книг (сотни тысяч страниц)
+    ]
+    
     queue, visited = list(seeds), set()
-    async with aiohttp.ClientSession(headers={'User-Agent': 'SearcliBot/1.0'}) as session:
+    random.shuffle(queue)
+    
+    headers = {'User-Agent': 'SearcliBot/1.0 (Labretto Project; Personal Search Engine)'}
+    
+    async with aiohttp.ClientSession(headers=headers) as session:
         while queue and len(visited) < TARGET_PAGES:
             url = queue.pop(0)
-            if url in visited: continue
+            if url in visited or not url.startswith('http'): continue
+            
             try:
-                async with session.get(url, timeout=5) as r:
+                # Увеличим таймаут до 10 секунд для тяжелых архивов типа Arxiv
+                async with session.get(url, timeout=10) as r:
                     if r.status != 200: continue
+                    
+                    # Проверка на размер страницы (чтобы не качать PDF или огромные файлы)
+                    if int(r.headers.get('Content-Length', 0)) > 2000000: continue 
+                    
+                    html_text = await r.text(errors='ignore')
                     visited.add(url)
-                    soup = BeautifulSoup(await r.text(errors='ignore'), 'html.parser')
-                    text = soup.get_text()
+                    soup = BeautifulSoup(html_text, 'html.parser')
+                    
+                    # Очистка и сбор данных
+                    for s in soup(["script", "style", "nav", "footer", "header"]):
+                        s.decompose()
+                        
                     title = (soup.title.string or url).strip()
-                    imgs = [(urljoin(url, i['src']), i.get('alt','')) for i in soup.find_all('img', src=True) if len(i.get('alt','')) > 3][:10]
-                    db.add_all(url, title, Counter(re.findall(r'[a-zа-яё0-9]{3,}', text.lower())), text, imgs)
-                    for a in soup.find_all('a', href=True)[:10]:
-                        l = urljoin(url, a['href'])
-                        if urlparse(l).netloc and l not in visited: queue.append(l)
-            except: continue
-            await asyncio.sleep(1.5) # Вежливая задержка для Render
+                    text = soup.get_text(separator=' ')
+                    
+                    # Сбор картинок
+                    imgs = []
+                    for i in soup.find_all('img', src=True):
+                        src = urljoin(url, i['src'])
+                        alt = i.get('alt', '').strip()
+                        if len(alt) > 5 and src.startswith('http'):
+                            imgs.append((src, alt))
+                            if len(imgs) >= 5: break
 
+                    # Сохранение
+                    db.add_all(url, title, Counter(re.findall(r'[a-zа-яё0-9]{3,}', text.lower())), text, imgs)
+                    
+                    # СБОР НОВЫХ ССЫЛОК (Стратегия прыжков)
+                    current_domain = urlparse(url).netloc
+                    page_links = []
+                    
+                    for a in soup.find_all('a', href=True):
+                        link = urljoin(url, a['href'])
+                        parsed = urlparse(link)
+                        
+                        # Не берем соцсети (они часто блокируют ботов)
+                        if any(x in link for x in ['facebook', 'twitter', 'instagram', 'vk.com']):
+                            continue
+                            
+                        if parsed.netloc and link not in visited:
+                            if parsed.netloc != current_domain:
+                                queue.insert(0, link) # Внешние ссылки — в приоритет
+                            else:
+                                page_links.append(link)
+                        
+                        if len(page_links) >= 8: break # Берем чуть больше ссылок для ветвления
+                    
+                    queue.extend(page_links)
+
+            except: continue
+            await asyncio.sleep(1.2) # Обязательная пауза
 HTML = """
 <!DOCTYPE html>
 <html lang="ru">
