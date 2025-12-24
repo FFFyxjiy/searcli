@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 # --- CONFIG ---
 TARGET_PAGES = 15000
-DB_NAME = "searcli_final.db"
+DB_NAME = "searcli_v2.db"
 STOP_WORDS = {"как", "что", "такое", "где", "это", "для", "под", "над", "в", "на", "и", "или", "быть", "с", "по", "ли"}
 
 
@@ -87,87 +87,76 @@ def get_widgets():
 
 
 async def crawler():
-    # Список "стартовых ворот" для глобального поиска
+    # Мы используем разные стартовые точки для максимального охвата
     seeds = [
-        "https://ru.wikipedia.org/wiki/Служебная:Random", # Случайные статьи для разнообразия
-        "https://news.google.com/", 
-        "https://www.rbc.ru/",
+        "https://ru.wikipedia.org/wiki/Служебная:Random",
         "https://habr.com/ru/all/",
-        "https://www.dmoz-odp.org/",
-        "https://en.wikipedia.org/wiki/Main_Page"
+        "https://www.rbc.ru/",
+        "https://en.wikipedia.org/wiki/Special:Random",
+        "https://www.interfax.ru/"
     ]
     
-    # Очередь ссылок и набор посещенных адресов
-    queue, visited = list(seeds), set()
+    # Чтобы поиск заработал сразу, перемешиваем семена
+    queue = seeds.copy()
+    random.shuffle(queue)
+    visited = set()
     
-    # Настройка сессии с User-Agent, чтобы сайты нас не блокировали
-    headers = {'User-Agent': 'SearcliBot/1.0 (Public Edition; by Labretto)'}
+    headers = {'User-Agent': 'SearcliBot/1.0 (Labretto Global Search)'}
     
     async with aiohttp.ClientSession(headers=headers) as session:
         while queue and len(visited) < TARGET_PAGES:
             url = queue.pop(0)
-            if url in visited:
+            
+            if url in visited or not url.startswith('http'):
                 continue
             
             try:
-                # Устанавливаем таймаут, чтобы не ждать "зависшие" сайты вечно
-                async with session.get(url, timeout=7) as response:
+                # Ставим таймаут поменьше (5 сек), чтобы бот не висел на "мертвых" сайтах
+                async with session.get(url, timeout=5) as response:
                     if response.status != 200:
                         continue
-                    
+                        
+                    html = await response.text(errors='ignore')
                     visited.add(url)
-                    html_content = await response.text(errors='ignore')
-                    soup = BeautifulSoup(html_content, 'html.parser')
                     
-                    # 1. Извлекаем картинки
+                    soup = BeautifulSoup(html, 'html.parser')
+                    
+                    # Извлекаем данные
+                    title = (soup.title.string or url).strip()
+                    text = soup.get_text()
+                    
+                    # Картинки
                     imgs = []
                     for i in soup.find_all('img', src=True):
                         src = urljoin(url, i['src'])
                         alt = i.get('alt', '').strip()
-                        # Сохраняем только картинки с описанием (для качественного поиска)
-                        if src.startswith('http') and len(alt) > 3:
+                        if len(alt) > 3 and src.startswith('http'):
                             imgs.append((src, alt))
                     
-                    # 2. Извлекаем текст и заголовок
-                    title = (soup.title.string or url).strip()
-                    full_text = soup.get_text()
-                    # Считаем частоту слов (минимум 3 символа)
-                    word_counts = Counter(re.findall(r'[a-zа-яё0-9]{3,}', full_text.lower()))
+                    # Сохраняем (используем нашу функцию из DatabaseManager)
+                    word_counts = Counter(re.findall(r'[a-zа-яё0-9]{3,}', text.lower()))
+                    db.add_all(url, title, word_counts, text, imgs)
                     
-                    # 3. Сохраняем всё в нашу базу данных
-                    db.add_all(url, title, word_counts, full_text, imgs)
-                    
-                    # 4. Собираем новые ссылки для масштабирования поиска
-                    links_from_page = 0
-                    current_domain = urlparse(url).netloc
-                    
+                    # Логика сбора новых ссылок
+                    links_count = 0
                     for a in soup.find_all('a', href=True):
                         link = urljoin(url, a['href'])
-                        parsed_link = urlparse(link)
-                        
-                        # Проверяем, что это реальная ссылка, а не якорь или скрипт
-                        if parsed_link.netloc and link not in visited:
-                            # СТРАТЕГИЯ ВЫХОДА: Если ссылка ведет на ДРУГОЙ домен
-                            if parsed_link.netloc != current_domain:
-                                # Добавляем в начало очереди (приоритетный переход во "внешний мир")
+                        if link not in visited and urlparse(link).netloc:
+                            # Чередуем: одну в начало, одну в конец
+                            if links_count % 2 == 0:
                                 queue.insert(0, link)
                             else:
-                                # Ссылки внутри того же сайта добавляем в конец
                                 queue.append(link)
-                            
-                            links_from_page += 1
+                            links_count += 1
                         
-                        # Ограничение: не берем более 20 ссылок с одной страницы
-                        # Это не даст боту "утонуть" в бесконечных страницах одного Хабра
-                        if links_from_page > 20:
+                        if links_count > 10: # Берем только 10 ссылок, чтобы быстрее менять сайты
                             break
                             
-            except Exception as e:
-                # Если сайт недоступен или возникла ошибка DNS, просто идем дальше
+            except Exception:
                 continue
             
-            # Небольшая пауза, чтобы не перегружать серверы и свой процессор
-            await asyncio.sleep(0.5)
+            # Очень важная пауза для стабильности на Render
+            await asyncio.sleep(0.3)
 
 # --- UI HTML (ДИЗАЙН НЕ ТРОНУТ) ---
 HTML = """
