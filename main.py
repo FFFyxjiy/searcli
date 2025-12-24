@@ -1,4 +1,4 @@
-import asyncio, aiohttp, math, re, sqlite3, random, threading, requests
+import asyncio, aiohttp, math, re, sqlite3, random, threading, requests, os
 from flask import Flask, render_template_string, request
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
@@ -7,14 +7,14 @@ from collections import Counter
 app = Flask(__name__)
 
 # --- CONFIG ---
-TARGET_PAGES = 15000
+TARGET_PAGES = 10000
 DB_NAME = "searcli_v2.db"
 STOP_WORDS = {"как", "что", "такое", "где", "это", "для", "под", "над", "в", "на", "и", "или", "быть", "с", "по", "ли"}
-
 
 class DatabaseManager:
     def __init__(self, db_path=DB_NAME):
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self.conn.execute('PRAGMA journal_mode=WAL') # Режим для ускорения работы
         self.create_tables()
 
     def create_tables(self):
@@ -23,142 +23,80 @@ class DatabaseManager:
         cursor.execute('CREATE TABLE IF NOT EXISTS words (word TEXT, doc_id INTEGER, count INTEGER)')
         cursor.execute('CREATE TABLE IF NOT EXISTS images (id INTEGER PRIMARY KEY, img_url TEXT UNIQUE, page_url TEXT, alt TEXT)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_w ON words(word)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_img_alt ON images(alt)')
         self.conn.commit()
 
     def add_all(self, url, title, words, text, images):
         cursor = self.conn.cursor()
         try:
             cursor.execute("INSERT OR IGNORE INTO docs (url, title, views, content) VALUES (?, ?, ?, ?)", 
-                           (url, title, random.randint(1000, 100000), text))
+                           (url, title, random.randint(1000, 5000), text))
             row = cursor.execute("SELECT id FROM docs WHERE url=?", (url,)).fetchone()
             if row:
                 doc_id = row[0]
                 cursor.executemany("INSERT INTO words VALUES (?, ?, ?)", [(w, doc_id, c) for w, c in words.items()])
                 for img_url, alt in images:
-                    if img_url and len(img_url) < 500:
-                        cursor.execute("INSERT OR IGNORE INTO images (img_url, page_url, alt) VALUES (?, ?, ?)", (img_url, url, alt))
+                    cursor.execute("INSERT OR IGNORE INTO images (img_url, page_url, alt) VALUES (?, ?, ?)", (img_url, url, alt))
             self.conn.commit()
-        except Exception:
-            self.conn.rollback()
+        except: pass
 
     def search_text(self, query):
-        query_low = query.lower().strip()
-        q_words = [w for w in re.findall(r'[a-zа-яё0-9]{3,}', query_low) if w not in STOP_WORDS]
+        q_low = query.lower().strip()
+        q_words = [w for w in re.findall(r'[a-zа-яё0-9]{3,}', q_low) if w not in STOP_WORDS]
         if not q_words: return []
         cursor = self.conn.cursor()
         res = {}
         for word in q_words:
             cursor.execute('SELECT d.id, d.url, d.title, i.count, d.views, d.content FROM words i JOIN docs d ON i.doc_id = d.id WHERE i.word = ?', (word,))
             for d_id, url, title, tf, v, content in cursor.fetchall():
-                curr_title = (title or "").lower()
-                curr_content = (content or "").lower()
+                t_low = (title or "").lower()
                 score = (math.log(tf + 1) * 2 + math.log(v + 1))
-                if word in curr_title: score *= 5.0
-                if len(q_words) > 1 and query_low in curr_title: score *= 40.0
-                elif len(q_words) > 1 and query_low in curr_content: score *= 10.0
-                if d_id not in res:
-                    res[d_id] = {'url': url, 'title': title or url, 'score': score, 'snippet': (content or "")[:160]}
+                if word in t_low: score *= 10.0
+                if q_low in t_low: score *= 50.0
+                if d_id not in res: res[d_id] = {'url': url, 'title': title or url, 'score': score, 'snippet': (content or "")[:150]}
                 else: res[d_id]['score'] += score
         return sorted(res.values(), key=lambda x: x['score'], reverse=True)
 
     def search_img(self, query):
-        if not query: return []
         cursor = self.conn.cursor()
-        cursor.execute("SELECT img_url, alt FROM images WHERE alt LIKE ? LIMIT 50", ('%' + query + '%',))
+        cursor.execute("SELECT img_url, alt FROM images WHERE alt LIKE ? LIMIT 30", ('%' + query + '%',))
         return cursor.fetchall()
-
 
 db = DatabaseManager()
 
-
 def get_widgets():
-    data = {"usd": "00.00", "temp": "0"}
+    data = {"usd": "78.50", "temp": "0", "idx": "0"}
     try:
-        # Запросы с коротким таймаутом, чтобы не тормозить загрузку страницы
-        r1 = requests.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=1.5).json()
+        r1 = requests.get("https://www.cbr-xml-daily.ru/daily_json.js", timeout=1).json()
         data["usd"] = f"{r1['Valute']['USD']['Value']:.2f}"
-        r2 = requests.get("https://api.open-meteo.com/v1/forecast?latitude=55.75&longitude=37.61&current_weather=true",
-                          timeout=1.5).json()
-        data["temp"] = f"{int(round(r2['current_weather']['temperature']))}°C"
-    except Exception:
-        pass  # Если API не ответило, просто выведем значения по умолчанию
+        r2 = requests.get("https://api.open-meteo.com/v1/forecast?latitude=55.75&longitude=37.61&current_weather=true", timeout=1).json()
+        data["temp"] = f"{int(round(r2['current_weather']['temperature']))}"
+        c = db.conn.cursor()
+        data["idx"] = c.execute("SELECT count(*) FROM docs").fetchone()[0]
+    except: pass
     return data
 
-
 async def crawler():
-    # Мы используем разные стартовые точки для максимального охвата
-    seeds = [
-        "https://ru.wikipedia.org/wiki/Служебная:Random",
-        "https://habr.com/ru/all/",
-        "https://www.rbc.ru/",
-        "https://en.wikipedia.org/wiki/Special:Random",
-        "https://www.interfax.ru/"
-    ]
-    
-    # Чтобы поиск заработал сразу, перемешиваем семена
-    queue = seeds.copy()
-    random.shuffle(queue)
-    visited = set()
-    
-    headers = {'User-Agent': 'SearcliBot/1.0 (Labretto Global Search)'}
-    
-    async with aiohttp.ClientSession(headers=headers) as session:
+    seeds = ["https://ru.wikipedia.org/wiki/Служебная:Random", "https://news.google.com/", "https://www.rbc.ru/"]
+    queue, visited = list(seeds), set()
+    async with aiohttp.ClientSession(headers={'User-Agent': 'SearcliBot/1.0'}) as session:
         while queue and len(visited) < TARGET_PAGES:
             url = queue.pop(0)
-            
-            if url in visited or not url.startswith('http'):
-                continue
-            
+            if url in visited: continue
             try:
-                # Ставим таймаут поменьше (5 сек), чтобы бот не висел на "мертвых" сайтах
-                async with session.get(url, timeout=5) as response:
-                    if response.status != 200:
-                        continue
-                        
-                    html = await response.text(errors='ignore')
+                async with session.get(url, timeout=5) as r:
+                    if r.status != 200: continue
                     visited.add(url)
-                    
-                    soup = BeautifulSoup(html, 'html.parser')
-                    
-                    # Извлекаем данные
-                    title = (soup.title.string or url).strip()
+                    soup = BeautifulSoup(await r.text(errors='ignore'), 'html.parser')
                     text = soup.get_text()
-                    
-                    # Картинки
-                    imgs = []
-                    for i in soup.find_all('img', src=True):
-                        src = urljoin(url, i['src'])
-                        alt = i.get('alt', '').strip()
-                        if len(alt) > 3 and src.startswith('http'):
-                            imgs.append((src, alt))
-                    
-                    # Сохраняем (используем нашу функцию из DatabaseManager)
-                    word_counts = Counter(re.findall(r'[a-zа-яё0-9]{3,}', text.lower()))
-                    db.add_all(url, title, word_counts, text, imgs)
-                    
-                    # Логика сбора новых ссылок
-                    links_count = 0
-                    for a in soup.find_all('a', href=True):
-                        link = urljoin(url, a['href'])
-                        if link not in visited and urlparse(link).netloc:
-                            # Чередуем: одну в начало, одну в конец
-                            if links_count % 2 == 0:
-                                queue.insert(0, link)
-                            else:
-                                queue.append(link)
-                            links_count += 1
-                        
-                        if links_count > 10: # Берем только 10 ссылок, чтобы быстрее менять сайты
-                            break
-                            
-            except Exception:
-                continue
-            
-            # Очень важная пауза для стабильности на Render
-            await asyncio.sleep(0.3)
+                    title = (soup.title.string or url).strip()
+                    imgs = [(urljoin(url, i['src']), i.get('alt','')) for i in soup.find_all('img', src=True) if len(i.get('alt','')) > 3][:10]
+                    db.add_all(url, title, Counter(re.findall(r'[a-zа-яё0-9]{3,}', text.lower())), text, imgs)
+                    for a in soup.find_all('a', href=True)[:15]:
+                        l = urljoin(url, a['href'])
+                        if urlparse(l).netloc and l not in visited: queue.append(l)
+            except: continue
+            await asyncio.sleep(1) # Даем серверу "подышать"
 
-# --- UI HTML (ДИЗАЙН НЕ ТРОНУТ) ---
 HTML = """
 <!DOCTYPE html>
 <html lang="ru">
@@ -166,140 +104,75 @@ HTML = """
     <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Searcli</title>
     <style>
-        :root { 
-            --bg: #ffffff; --text: #202124; --primary: #8e44ad; --border: #dfe1e5; 
-            --sub: #70757a; --dev-text: #666; --accent: #27ae60;
-        }
-        @media (prefers-color-scheme: dark) {
-            :root { 
-                --bg: #121212; --text: #e8eaed; --primary: #bb86fc; --border: #333; 
-                --sub: #9aa0a6; --dev-text: #fff;
-            }
-        }
-
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 0; overflow-x: hidden; }
-
-        .container { 
-            width: 100%; max-width: 800px; margin: 0 auto; padding: 15px; 
-            box-sizing: border-box; display: flex; flex-direction: column; align-items: center; 
-        }
-
-        /* Logo Section */
-        .logo-box { text-align: center; margin: 40px 0 20px; width: 100%; }
-        .logo { font-size: clamp(48px, 15vw, 72px); font-weight: 500; color: var(--primary); text-decoration: none; display: block; }
-        .developer { font-size: 14px; font-weight: 300; margin-top: 5px; opacity: 0.8; }
-
-        /* Widgets Grid - Улучшенная адаптивность */
-        .widgets { 
-            display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; 
-            margin-bottom: 25px; width: 100%; max-width: 500px; 
-        }
-        .widget { 
-            background: var(--card, var(--border)); padding: 12px; 
-            border-radius: 15px; text-align: center; opacity: 0.9;
-        }
-        .widget-val { font-size: 18px; font-weight: bold; }
-        .widget-label { font-size: 10px; text-transform: uppercase; margin-top: 4px; }
-
-        /* Search Form */
-        .search-form { width: 100%; margin-bottom: 20px; }
-        .search-input { 
-            width: 100%; padding: 16px 24px; border-radius: 30px; 
-            border: 1px solid var(--border); background: var(--bg); 
-            color: var(--text); font-size: 16px; outline: none; 
-            box-sizing: border-box; -webkit-appearance: none; /* Убирает тени на iOS */
-        }
-
-        /* Tabs */
-        .tabs { display: flex; gap: 25px; margin-bottom: 20px; border-bottom: 1px solid var(--border); width: 100%; justify-content: center; }
-        .tab { text-decoration: none; color: var(--sub); font-size: 15px; padding: 10px 5px; position: relative; }
-        .tab.active { color: var(--primary); font-weight: bold; }
-        .tab.active::after { content: ''; position: absolute; bottom: -1px; left: 0; width: 100%; height: 2px; background: var(--primary); }
-
-        /* Results */
-        .res-item { width: 100%; margin-bottom: 25px; word-wrap: break-word; }
-        .res-title { font-size: 18px; color: var(--primary); text-decoration: none; line-height: 1.3; }
-        .snippet { font-size: 14px; color: var(--sub); margin-top: 6px; line-height: 1.5; }
-        .rating-box { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 12px; }
-        .rating-bar { flex: 0 0 80px; height: 5px; background: #ddd; border-radius: 3px; overflow: hidden; }
-
-        /* Images Grid - Резина */
-        .img-grid { 
-            display: grid; 
-            grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); 
-            gap: 8px; width: 100%; 
-        }
-        .img-card { aspect-ratio: 1/1; border-radius: 10px; overflow: hidden; background: #333; }
+        :root { --bg: #121212; --text: #e8eaed; --primary: #bb86fc; --border: #333; --sub: #9aa0a6; }
+        body { font-family: sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 0; }
+        .container { max-width: 800px; margin: 0 auto; padding: 20px; display: flex; flex-direction: column; align-items: center; min-height: 100vh; }
+        .logo-box { text-align: center; margin: 40px 0; }
+        .logo { font-size: 72px; font-weight: 500; color: var(--primary); text-decoration: none; }
+        .widgets { display: flex; gap: 10px; margin-bottom: 30px; }
+        .widget { background: #1e1e1e; padding: 15px; border-radius: 15px; text-align: center; border: 1px solid var(--border); min-width: 80px; }
+        .search-input { width: 100%; max-width: 600px; padding: 15px 25px; border-radius: 50px; border: 1px solid var(--border); background: #1e1e1e; color: var(--text); font-size: 18px; outline: none; }
+        .tabs { margin: 20px 0; display: flex; gap: 20px; }
+        .tab { text-decoration: none; color: var(--sub); font-size: 14px; }
+        .tab.active { color: var(--primary); font-weight: bold; border-bottom: 2px solid var(--primary); }
+        .res-item { width: 100%; margin-bottom: 30px; text-align: left; }
+        .res-title { font-size: 20px; color: var(--primary); text-decoration: none; }
+        .rating-bar { width: 100px; height: 4px; background: #333; border-radius: 2px; margin-top: 8px; overflow: hidden; }
+        .img-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; width: 100%; }
+        .img-card { height: 150px; border-radius: 8px; overflow: hidden; background: #333; }
         .img-card img { width: 100%; height: 100%; object-fit: cover; }
-
-        /* Mobile Optimization */
-        @media (max-width: 480px) {
-            .container { padding: 10px; }
-            .logo-box { margin-top: 20px; }
-            .res-title { font-size: 17px; }
-            .widgets { grid-template-columns: 1fr 1fr; }
-        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="logo-box">
             <a href="/" class="logo">Searcli</a>
-            <div class="developer" style="color: var(--dev-text); font-size: 14px; font-weight: 300; margin-top: 5px;">developer by Labretto</div>
+            <div style="font-size: 14px; font-weight: 300; opacity: 0.7;">developer by Labretto</div>
         </div>
         {% if not q %}<div class="widgets">
-            <div class="widget"><div style="font-weight:bold">{{ w.temp }}</div><div style="font-size:10px">ПОГОДА</div></div>
-            <div class="widget"><div style="font-weight:bold">{{ w.usd }} ₽</div><div style="font-size:10px">КУРС USD</div></div>
+            <div class="widget"><div style="font-weight:bold">{{ w.temp }}°C</div><div style="font-size:10px">ПОГОДА</div></div>
+            <div class="widget"><div style="font-weight:bold">{{ w.usd }} ₽</div><div style="font-size:10px">USD/RUB</div></div>
+            <div class="widget"><div style="font-weight:bold">{{ w.idx }}</div><div style="font-size:10px">ИНДЕКС</div></div>
         </div>{% endif %}
         <form action="/search" style="width:100%; text-align:center;">
             <input name="q" class="search-input" placeholder="Поиск..." value="{{ q }}" required>
             <input type="hidden" name="t" value="{{ t }}">
         </form>
-        <div class="tabs">
+        {% if q %}<div class="tabs">
             <a href="/search?q={{q}}&t=text" class="tab {% if t!='img' %}active{% endif %}">Все</a>
             <a href="/search?q={{q}}&t=img" class="tab {% if t=='img' %}active{% endif %}">Картинки</a>
-        </div>
-        {% if t == 'img' %}<div class="img-grid">
-            {% for i in results %}<div class="img-card"><a href="{{ i[0] }}" target="_blank"><img src="{{ i[0] }}" title="{{ i[1] }}" loading="lazy"></a></div>{% endfor %}
-        </div>{% else %}<div style="width:100%">
-            {% for r in results %}<div class="res-item">
-                <a href="{{ r.url }}" class="res-title" target="_blank">{{ r.title }}</a>
-                <div style="font-size:14px; color:var(--sub)">{{ r.snippet }}...</div>
-                <div style="display:flex; align-items:center; gap:10px; font-size:11px; color:var(--sub); margin-top:5px;">
-                    <div class="rating-bar"><div style="width:{{ [r.score*4, 100]|min }}%; height:100%; background:#27ae60"></div></div>
-                    Рейтинг: {{ "%.1f"|format(r.score) }}
-                </div>
-            </div>{% endfor %}
         </div>{% endif %}
-    </div>
-<div style="text-align: center; margin-top: 50px; padding-bottom: 20px; font-size: 10px; font-weight: 300; color: var(--sub); letter-spacing: 2px; opacity: 0.6;">
-        Searcli 1.0
+        <div style="width:100%">
+            {% if t == 'img' %}<div class="img-grid">
+                {% for i in results %}<div class="img-card"><a href="{{ i[0] }}" target="_blank"><img src="{{ i[0] }}"></a></div>{% endfor %}
+            </div>{% else %}
+                {% for r in results %}<div class="res-item">
+                    <a href="{{ r.url }}" class="res-title" target="_blank">{{ r.title }}</a>
+                    <div style="font-size:14px; color:var(--sub)">{{ r.snippet }}...</div>
+                    <div style="display:flex; align-items:center; gap:10px; font-size:11px; margin-top:5px; color:var(--sub);">
+                        <div class="rating-bar"><div style="width:{{ [r.score*2, 100]|min }}%; height:100%; background:#bb86fc"></div></div>
+                        Рейтинг: {{ "%.1f"|format(r.score) }}
+                    </div>
+                </div>{% endfor %}
+            {% endif %}
+        </div>
+        <div style="margin-top: auto; padding: 40px 0; font-size: 10px; font-weight: 300; letter-spacing: 3px; opacity: 0.5;">Searcli 1.0</div>
     </div>
 </body>
 </html>
 """
 
-
 @app.route('/')
 def home():
     return render_template_string(HTML, q="", t="text", results=[], w=get_widgets())
 
-
 @app.route('/search')
 def search():
-    q = request.args.get('q', '')
-    t = request.args.get('t', 'text')
-    # Используем английские if и else
-    if t == 'img':
-        res = db.search_img(q)
-    else:
-        res = db.search_text(q)
+    q, t = request.args.get('q', ''), request.args.get('t', 'text')
+    res = db.search_img(q) if t == 'img' else db.search_text(q)
     return render_template_string(HTML, q=q, t=t, results=res, w=get_widgets())
 
-
 if __name__ == '__main__':
-    import os
-    # Порт берется из настроек сервера или ставится 10000 по умолчанию
     port = int(os.environ.get("PORT", 10000))
     threading.Thread(target=lambda: asyncio.run(crawler()), daemon=True).start()
     app.run(host='0.0.0.0', port=port)
